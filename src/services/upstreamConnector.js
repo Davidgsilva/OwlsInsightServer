@@ -6,8 +6,7 @@ const { transformUpstreamData } = require('./dataTransformer');
  * UpstreamConnector - Connects to the upstream WebSocket odds provider
  * and relays data to the proxy server for broadcasting to clients.
  *
- * TODO: Create the connection to the upstream odds provider server
- * TODO: Configure the following environment variables:
+ * Configure the following environment variables:
  *   - UPSTREAM_WS_URL: WebSocket URL of the odds provider
  *   - OWLS_INSIGHT_SERVER_API_KEY: API key for authentication
  */
@@ -26,11 +25,8 @@ class UpstreamConnector {
     this.onError = options.onError || (() => {});
 
     // Upstream configuration
-    // TODO: Set UPSTREAM_WS_URL to the odds provider WebSocket URL
     this.upstreamUrl = process.env.UPSTREAM_WS_URL;
     this.upstreamPath = process.env.UPSTREAM_WS_PATH || '/socket.io';
-
-    // TODO: Set OWLS_INSIGHT_SERVER_API_KEY for authentication with upstream
     this.apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
 
     // Event name mapping (configure based on upstream server)
@@ -39,7 +35,6 @@ class UpstreamConnector {
 
   /**
    * Connect to the upstream WebSocket server
-   * TODO: Implement connection logic based on your upstream provider's requirements
    */
   connect() {
     if (!this.upstreamUrl) {
@@ -54,7 +49,6 @@ class UpstreamConnector {
     logger.info(`Connecting to upstream: ${this.upstreamUrl}`);
 
     // Build connection options
-    // TODO: Adjust connection options based on upstream server requirements
     const connectionOptions = {
       path: this.upstreamPath,
       transports: ['websocket', 'polling'],
@@ -63,14 +57,16 @@ class UpstreamConnector {
       reconnectionDelay: this.reconnectDelay,
     };
 
-    // Add authentication with API key
-    // TODO: Adjust auth format based on upstream server requirements
+    // Add authentication with API key (multiple formats for compatibility)
     if (this.apiKey) {
       connectionOptions.auth = {
         apiKey: this.apiKey,
       };
       connectionOptions.query = {
         apiKey: this.apiKey,
+      };
+      connectionOptions.extraHeaders = {
+        'X-API-Key': this.apiKey,
       };
     }
 
@@ -84,19 +80,15 @@ class UpstreamConnector {
       logger.info('Connected to upstream WebSocket server');
       this.onConnect();
 
-      // TODO: Subscribe to odds updates if upstream requires subscription
-      // Some servers require sending a subscription message after connecting
-      if (process.env.UPSTREAM_SUBSCRIBE_EVENT) {
-        this.socket.emit(process.env.UPSTREAM_SUBSCRIBE_EVENT, {
-          sports: ['nba', 'nfl', 'nhl', 'ncaab'],
-          markets: ['spreads', 'totals', 'h2h'],
-        });
-        logger.info(`Sent subscription request: ${process.env.UPSTREAM_SUBSCRIBE_EVENT}`);
-      }
+      // Subscribe to all sports and books
+      this.socket.emit('subscribe', {
+        sports: ['nba', 'ncaab', 'nfl', 'nhl'],
+        books: ['pinnacle', 'fanduel', 'draftkings', 'betmgm'],
+      });
+      logger.info('Sent subscription request for all sports and books');
     });
 
     // Handle odds update from upstream
-    // TODO: Adjust event name based on upstream server's event naming
     this.socket.on(this.upstreamEventName, (data) => {
       logger.debug(`Received odds update from upstream`);
       try {

@@ -1,59 +1,33 @@
 # Owls Insight Server
 
-WebSocket proxy server for Owls Insight - real-time odds aggregation.
+WebSocket proxy for real-time odds data.
 
-## Architecture
-
-```
-Upstream Odds Provider (WebSocket)
-        │
-        ▼
-┌─────────────────────────┐
-│  Owls Insight Server    │  ← This server
-│  (WebSocket Proxy)      │
-└───────────┬─────────────┘
-            │
-            ▼
-   N × Frontend Clients
-   (Owls Insight UI)
-```
-
-## Setup
+## Quick Start
 
 ```bash
-# Install dependencies
 npm install
-
-# Copy environment config
 cp .env.example .env
-
-# Configure .env with upstream connection details
-# - UPSTREAM_WS_URL
-# - OWLS_INSIGHT_SERVER_API_KEY
-
-# Start server
-npm run dev   # Development (with nodemon)
-npm start     # Production
+# Edit .env with your API key
+npm run dev
 ```
 
-## Environment Variables
+## Configuration
 
-| Variable | Description |
-|----------|-------------|
-| `PORT` | Server port (default: 3001) |
-| `CORS_ORIGIN` | Allowed origins (default: *) |
-| `UPSTREAM_WS_URL` | Upstream odds provider WebSocket URL |
-| `OWLS_INSIGHT_SERVER_API_KEY` | API key for upstream authentication |
-| `UPSTREAM_EVENT_NAME` | Event name for odds updates (default: odds-update) |
+Edit `.env`:
 
-## Endpoints
+```
+UPSTREAM_WS_URL=http://k8s-owlsinsi-owlsinsi-67f6aee9f8-724108586.us-east-1.elb.amazonaws.com
+OWLS_INSIGHT_SERVER_API_KEY=your_api_key_here
+PORT=3001
+```
 
-- `GET /health` - Health check with connection status
-- `WebSocket /socket.io` - Client connections
+## Verify
 
-## Client Events
+Server running:
+```
+[info] OWLS INSIGHT SERVER
+[info] Server running on port 3001
+[info] Connected to upstream WebSocket server
+```
 
-| Event | Direction | Description |
-|-------|-----------|-------------|
-| `odds-update` | Server → Client | Odds data broadcast |
-| `request-odds` | Client → Server | Request latest odds |
+Health check: `http://localhost:3001/health`
