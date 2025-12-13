@@ -7,7 +7,7 @@ const logger = require('../utils/logger');
  * Expected output format for Owls Insight:
  * {
  *   sports: {
- *     nba: [{ id, home_team, away_team, commence_time, bookmakers: [...] }],
+ *     nba: [{ id, home_team, away_team, commence_time, bookmakers: [...], averages: {...} }],
  *     nfl: [...],
  *     nhl: [...],
  *     ncaab: [...]
@@ -17,14 +17,112 @@ const logger = require('../utils/logger');
  */
 
 /**
+ * Calculate average odds across all bookmakers for an event
+ * @param {Object} event - Event with bookmakers array
+ * @returns {Object|null} - Averages for spread, total, and moneyline
+ */
+function calculateEventAverages(event) {
+  const bookmakers = event.bookmakers || [];
+  if (bookmakers.length === 0) return null;
+
+  // Collect values from all bookmakers
+  const spreadHomePoints = [], spreadHomeOdds = [];
+  const spreadAwayPoints = [], spreadAwayOdds = [];
+  const totalOverPoints = [], totalOverOdds = [];
+  const totalUnderPoints = [], totalUnderOdds = [];
+  const mlHome = [], mlAway = [];
+
+  bookmakers.forEach(book => {
+    (book.markets || []).forEach(market => {
+      if (market.key === 'spreads') {
+        (market.outcomes || []).forEach(o => {
+          if (o.name === event.home_team) {
+            if (o.point != null) spreadHomePoints.push(o.point);
+            if (o.price != null) spreadHomeOdds.push(o.price);
+          } else {
+            if (o.point != null) spreadAwayPoints.push(o.point);
+            if (o.price != null) spreadAwayOdds.push(o.price);
+          }
+        });
+      } else if (market.key === 'totals') {
+        (market.outcomes || []).forEach(o => {
+          if (o.name === 'Over') {
+            if (o.point != null) totalOverPoints.push(o.point);
+            if (o.price != null) totalOverOdds.push(o.price);
+          } else {
+            if (o.point != null) totalUnderPoints.push(o.point);
+            if (o.price != null) totalUnderOdds.push(o.price);
+          }
+        });
+      } else if (market.key === 'h2h') {
+        (market.outcomes || []).forEach(o => {
+          if (o.name === event.home_team) {
+            if (o.price != null) mlHome.push(o.price);
+          } else {
+            if (o.price != null) mlAway.push(o.price);
+          }
+        });
+      }
+    });
+  });
+
+  // Helper functions
+  const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+  const roundPoint = v => v != null ? Math.round(v * 2) / 2 : null; // Round to nearest 0.5
+  const roundOdds = v => v != null ? Math.round(v) : null;
+
+  return {
+    spread: {
+      home: roundPoint(avg(spreadHomePoints)),
+      homeOdds: roundOdds(avg(spreadHomeOdds)),
+      away: roundPoint(avg(spreadAwayPoints)),
+      awayOdds: roundOdds(avg(spreadAwayOdds))
+    },
+    total: {
+      over: roundPoint(avg(totalOverPoints)),
+      overOdds: roundOdds(avg(totalOverOdds)),
+      under: roundPoint(avg(totalUnderPoints)),
+      underOdds: roundOdds(avg(totalUnderOdds))
+    },
+    moneyline: {
+      home: roundOdds(avg(mlHome)),
+      away: roundOdds(avg(mlAway))
+    }
+  };
+}
+
+/**
+ * Add averages to all events in sports object
+ * @param {Object} sports - Object with sport arrays
+ * @returns {Object} - Sports object with averages added to each event
+ */
+function addAveragesToSports(sports) {
+  const result = {};
+  Object.keys(sports).forEach(sport => {
+    if (Array.isArray(sports[sport])) {
+      result[sport] = sports[sport].map(event => ({
+        ...event,
+        averages: calculateEventAverages(event)
+      }));
+    } else {
+      result[sport] = sports[sport];
+    }
+  });
+  return result;
+}
+
+/**
  * Transform upstream data to Owls Insight format
  * @param {Object} upstreamData - Raw data from upstream WebSocket
  * @returns {Object} - Transformed data for Owls Insight
  */
 function transformUpstreamData(upstreamData) {
-  // If data is already in correct format, return as-is
+  // If data is already in correct format, add averages and return
   if (upstreamData.sports && typeof upstreamData.sports === 'object') {
-    return upstreamData;
+    return {
+      ...upstreamData,
+      sports: addAveragesToSports(upstreamData.sports)
+    };
   }
 
   // If upstream sends data in The Odds API format
@@ -79,7 +177,7 @@ function transformOddsApiFormat(events) {
   });
 
   return {
-    sports,
+    sports: addAveragesToSports(sports),
     openingLines: {},
   };
 }

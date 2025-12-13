@@ -22,7 +22,8 @@ app.use(express.json());
 // In-memory short TTL cache to avoid bursty drawer refreshes
 const historyCache = new Map();
 const HISTORY_TTL_MS = 30 * 1000;
-const historyWatchers = new Map(); // socketId -> { key, timer }
+// socketId -> Map<key, { timer }>
+const historyWatchers = new Map();
 const HISTORY_POLL_MS = 60 * 1000;
 
 const getApiBaseUrl = () => {
@@ -155,6 +156,15 @@ async function fetchCombinedHistory({ eventId, book, market, hours }) {
   return data;
 }
 
+function clearSocketWatchers(socketId) {
+  const watchers = historyWatchers.get(socketId);
+  if (!watchers) return;
+  for (const entry of watchers.values()) {
+    if (entry?.timer) clearInterval(entry.timer);
+  }
+  historyWatchers.delete(socketId);
+}
+
 app.get('/api/history', async (req, res) => {
   const { eventId, book, market, hours } = req.query;
   if (!eventId || !book || !market) {
@@ -247,9 +257,8 @@ io.on('connection', (socket) => {
     const key = `${eventId}|${book}|${market}|${hours || ''}`;
     logger.debug(`[Downstream] ${socket.id} watch-history ${key}`);
 
-    // Clear any existing watcher
-    const existing = historyWatchers.get(socket.id);
-    if (existing?.timer) clearInterval(existing.timer);
+    // Clear any existing watchers (drawer is single-subscription UX)
+    clearSocketWatchers(socket.id);
 
     const sendUpdate = async () => {
       try {
@@ -262,13 +271,59 @@ io.on('connection', (socket) => {
 
     await sendUpdate();
     const timer = setInterval(sendUpdate, HISTORY_POLL_MS);
-    historyWatchers.set(socket.id, { key, timer });
+    historyWatchers.set(socket.id, new Map([[key, { timer }]]));
+  });
+
+  // Multi-book live history for line movement chart
+  socket.on('watch-history-multi', async (params = {}) => {
+    const { eventId, books, market, hours } = params;
+    if (!eventId || !Array.isArray(books) || books.length === 0 || !market) return;
+
+    const uniqBooks = Array.from(new Set(books.map((b) => String(b).trim()).filter(Boolean))).sort();
+    const key = `${eventId}|multi|${uniqBooks.join(',')}|${market}|${hours || ''}`;
+    logger.debug(`[Downstream] ${socket.id} watch-history-multi ${key}`);
+
+    // Clear any existing watchers (drawer is single-subscription UX)
+    clearSocketWatchers(socket.id);
+
+    const sendUpdate = async () => {
+      const settled = await Promise.allSettled(
+        uniqBooks.map((book) => fetchCombinedHistory({ eventId, book, market, hours }))
+      );
+
+      const byBook = {};
+      const errors = {};
+      settled.forEach((result, idx) => {
+        const book = uniqBooks[idx];
+        if (result.status === 'fulfilled' && result.value?.success) {
+          byBook[book] = result.value.data;
+        } else {
+          errors[book] = result.status === 'rejected'
+            ? result.reason?.message || 'failed'
+            : result.value?.error || 'failed';
+        }
+      });
+
+      socket.emit('history-multi-update', {
+        success: true,
+        data: {
+          eventId,
+          market,
+          hours: hours || null,
+          books: uniqBooks,
+          byBook,
+          errors: Object.keys(errors).length > 0 ? errors : undefined,
+        },
+      });
+    };
+
+    await sendUpdate();
+    const timer = setInterval(sendUpdate, HISTORY_POLL_MS);
+    historyWatchers.set(socket.id, new Map([[key, { timer }]]));
   });
 
   socket.on('unwatch-history', () => {
-    const existing = historyWatchers.get(socket.id);
-    if (existing?.timer) clearInterval(existing.timer);
-    historyWatchers.delete(socket.id);
+    clearSocketWatchers(socket.id);
     logger.debug(`[Downstream] ${socket.id} unwatch-history`);
   });
 
@@ -298,9 +353,7 @@ io.on('connection', (socket) => {
 
   // Handle client disconnect
   socket.on('disconnect', (reason) => {
-    const existing = historyWatchers.get(socket.id);
-    if (existing?.timer) clearInterval(existing.timer);
-    historyWatchers.delete(socket.id);
+    clearSocketWatchers(socket.id);
     logger.info(`Client disconnected: ${socket.id} (Reason: ${reason}, Remaining: ${io.engine.clientsCount})`);
   });
 });

@@ -34,9 +34,9 @@ Upstream Odds Provider (WebSocket)
 
 ### Key Components
 
-- **src/index.js** - Main entry point. Sets up Express server, Socket.io for clients, initializes upstream connector, manages cached odds data (`latestOddsData`, `openingLines`), and handles graceful shutdown.
+- **src/index.js** - Main entry point. Sets up Express server, Socket.io for clients, initializes upstream connector, manages cached odds data (`latestOddsData`, `openingLines`), history proxy with caching, and handles graceful shutdown.
 
-- **src/services/upstreamConnector.js** - Socket.io client that connects to the upstream odds provider. Handles authentication (API key via auth object and query params), reconnection logic, and event subscriptions. Requires `UPSTREAM_WS_URL` and `OWLS_INSIGHT_SERVER_API_KEY` env vars.
+- **src/services/upstreamConnector.js** - Socket.io client that connects to the upstream odds provider. Handles authentication (API key via auth object, query params, and headers), reconnection logic, and event subscriptions. On connect, subscribes to sports: `['nba', 'ncaab', 'nfl', 'nhl']` and books: `['pinnacle', 'fanduel', 'draftkings', 'betmgm', 'bet365']`.
 
 - **src/services/dataTransformer.js** - Normalizes upstream data to Owls Insight format. Handles multiple input formats including The Odds API format (array of events) and pre-formatted sports objects. Output structure: `{ sports: { nba: [], nfl: [], nhl: [], ncaab: [] }, openingLines: {} }`
 
@@ -49,7 +49,32 @@ Upstream Odds Provider (WebSocket)
 3. `broadcastOddsUpdate()` caches data and emits to all connected clients
 4. New clients receive cached data immediately on connection
 
-### Client Events
+### Client Events (Socket.io)
 
 - `odds-update` (server→client): Broadcast odds data
 - `request-odds` (client→server): Request latest cached odds
+- `watch-history` (client→server): Subscribe to live history updates for a specific event/book/market
+- `unwatch-history` (client→server): Unsubscribe from history updates
+- `history-update` (server→client): Push history data to subscribed clients (polls every 60s)
+
+### REST Endpoints
+
+- `GET /health` - Health check with uptime, connections count, upstream status
+- `GET /api/history?eventId=&book=&market=&hours=` - Proxy to fetch odds history from upstream API
+
+### Environment Variables
+
+Required:
+- `UPSTREAM_WS_URL` - WebSocket URL of upstream odds provider
+- `OWLS_INSIGHT_SERVER_API_KEY` - API key for upstream authentication
+
+Optional:
+- `PORT` (default: 3001) - Server port
+- `CORS_ORIGIN` (default: `*`) - CORS allowed origins
+- `LOG_LEVEL` (default: `info`) - Winston log level
+- `UPSTREAM_WS_PATH` (default: `/socket.io`) - Socket.io path on upstream
+- `UPSTREAM_EVENT_NAME` (default: `odds-update`) - Event name for odds data
+- `UPSTREAM_ADDITIONAL_EVENTS` - Comma-separated additional event names to listen for
+- `UPSTREAM_MAX_RECONNECTS` (default: 10) - Max reconnection attempts
+- `UPSTREAM_RECONNECT_DELAY` (default: 5000) - Delay between reconnects in ms
+- `OWLS_INSIGHT_API_BASE_URL` - Override base URL for history API (derived from `UPSTREAM_WS_URL` if not set)
