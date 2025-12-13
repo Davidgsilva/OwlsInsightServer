@@ -1,0 +1,202 @@
+# Owls Insight Server Deployment
+# WebSocket proxy server that relays odds from upstream to frontend clients
+#
+# Architecture:
+# - Connects to nba-odds-app WebSocket as upstream
+# - Serves Owls Insight frontend clients via Socket.io
+# - Stateless, horizontally scalable
+#
+# Best Practices Applied:
+# - Sticky sessions for WebSocket connections
+# - PodDisruptionBudget for zero-downtime deployments
+# - HPA for autoscaling
+# - Graceful shutdown with preStop hooks
+
+---
+# Service (ClusterIP - ALB Ingress handles external traffic)
+apiVersion: v1
+kind: Service
+metadata:
+  name: owls-insight-server
+  namespace: owls-insight-dev
+  labels:
+    app: owls-insight-server
+spec:
+  type: ClusterIP
+  # Sticky sessions for WebSocket connections
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800  # 3 hours
+  ports:
+    - port: 80
+      targetPort: 3001
+      protocol: TCP
+      name: http
+  selector:
+    app: owls-insight-server
+
+---
+# PodDisruptionBudget - ensures availability during rollouts
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: owls-insight-server-pdb
+  namespace: owls-insight-dev
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: owls-insight-server
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: owls-insight-server
+  namespace: owls-insight-dev
+  labels:
+    app: owls-insight-server
+    version: v1
+spec:
+  replicas: 2
+
+  # Rolling update for zero-downtime deployments
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  selector:
+    matchLabels:
+      app: owls-insight-server
+
+  template:
+    metadata:
+      labels:
+        app: owls-insight-server
+        version: v1
+    spec:
+      # Security: Don't run as root
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+
+      containers:
+        - name: owls-insight-server
+          image: 482566359918.dkr.ecr.us-east-1.amazonaws.com/owls-insight-server:v1.0.0
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 3001
+              name: http
+              protocol: TCP
+
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: PORT
+              value: "3001"
+            # Upstream WebSocket URL (nba-odds-app in same cluster)
+            - name: UPSTREAM_WS_URL
+              value: "ws://owls-insight-api-server:80"
+            # API key for upstream authentication
+            - name: OWLS_INSIGHT_SERVER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: owls-insight-server-api-key
+            # CORS - allow all origins (API key is security)
+            - name: CORS_ORIGIN
+              value: "*"
+            # Log level
+            - name: LOG_LEVEL
+              value: "info"
+
+          # Resource limits - lightweight WebSocket proxy
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+
+          # Readiness probe
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+
+          # Liveness probe
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Graceful shutdown
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
+
+      # Extended termination period for WebSocket draining
+      terminationGracePeriodSeconds: 30
+
+      restartPolicy: Always
+      dnsPolicy: ClusterFirst
+
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: owls-insight-server-hpa
+  namespace: owls-insight-dev
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: owls-insight-server
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
