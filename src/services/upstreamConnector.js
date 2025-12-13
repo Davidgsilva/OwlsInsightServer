@@ -91,6 +91,43 @@ class UpstreamConnector {
     // Handle odds update from upstream
     this.socket.on(this.upstreamEventName, (data) => {
       logger.debug(`Received odds update from upstream`);
+
+      // Generic debug sampling for payload shape (safe, small)
+      try {
+        const sportsObj = data.sports || {};
+        Object.entries(sportsObj).forEach(([sportKey, games]) => {
+          if (!Array.isArray(games) || games.length === 0) return;
+          const g = games[0];
+          const bookKeys = (g.bookmakers || []).map(b => b.key).filter(Boolean);
+          logger.debug(
+            `[Upstream] sample ${sportKey}: id=${g.id || 'n/a'} eventId=${g.eventId || 'NOT_SET'} ` +
+            `teams=${g.away_team || g.awayTeam} @ ${g.home_team || g.homeTeam} ` +
+            `commence=${g.commence_time || g.startTime || 'n/a'} ` +
+            `books=${bookKeys.join(',') || 'none'}`
+          );
+        });
+      } catch (e) {
+        logger.warn(`[Upstream] sampling failed: ${e.message}`);
+      }
+
+      // DEBUG: Look for specific games (Carolina, Bakersfield)
+      if (data.sports?.ncaab) {
+        console.log('\n========== NCAAB GAMES - Looking for Carolina/Bakersfield ==========');
+        data.sports.ncaab.forEach((game, i) => {
+          const teams = `${game.away_team} @ ${game.home_team}`;
+          const isTarget = teams.toLowerCase().includes('carolina') ||
+                          teams.toLowerCase().includes('bakersfield');
+          if (isTarget) {
+            console.log(`\nGAME: ${teams}`);
+            console.log('  commence_time:', game.commence_time);
+            console.log('  status:', game.status);
+            console.log('  bookmakers:', game.bookmakers?.map(b => b.key).join(', ') || 'none');
+          }
+        });
+        console.log('\nTotal NCAAB games:', data.sports.ncaab.length);
+        console.log('==================================================================\n');
+      }
+
       try {
         const transformedData = transformUpstreamData(data);
         this.onOddsUpdate(transformedData);
