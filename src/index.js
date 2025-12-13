@@ -191,6 +191,16 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Internal endpoint for connection tracking (used by rainbow deployments)
+app.get('/internal/connections', (req, res) => {
+  res.json({
+    pod: process.env.HOSTNAME || 'unknown',
+    version: process.env.APP_VERSION || 'unknown',
+    connections: io.engine.clientsCount,
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // Create HTTP server
 const server = http.createServer(app);
 
