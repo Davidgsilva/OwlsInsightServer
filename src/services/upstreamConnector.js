@@ -82,7 +82,7 @@ class UpstreamConnector {
 
       // Subscribe to all sports and books
       this.socket.emit('subscribe', {
-        sports: ['nba', 'ncaab', 'nfl', 'nhl'],
+        sports: ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'],
         books: ['pinnacle', 'fanduel', 'draftkings', 'betmgm', 'bet365'],
       });
       logger.info('Sent subscription request for all sports and books');

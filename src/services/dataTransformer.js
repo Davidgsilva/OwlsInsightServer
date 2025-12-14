@@ -10,7 +10,8 @@ const logger = require('../utils/logger');
  *     nba: [{ id, home_team, away_team, commence_time, bookmakers: [...], averages: {...} }],
  *     nfl: [...],
  *     nhl: [...],
- *     ncaab: [...]
+ *     ncaab: [...],
+ *     ncaaf: [...]
  *   },
  *   openingLines: { ... }
  * }
@@ -150,14 +151,16 @@ function transformOddsApiFormat(events) {
     nfl: [],
     nhl: [],
     ncaab: [],
+    ncaaf: [],
   };
 
   const sportKeyMapping = {
     'basketball_nba': 'nba',
     'football_nfl': 'nfl',
+    'americanfootball_nfl': 'nfl',
     'icehockey_nhl': 'nhl',
     'basketball_ncaab': 'ncaab',
-    'basketball_ncaaf': 'ncaab',
+    'americanfootball_ncaaf': 'ncaaf',
   };
 
   events.forEach((event) => {
@@ -238,7 +241,7 @@ function validateOwlsInsightFormat(data) {
     return false;
   }
 
-  const validSports = ['nba', 'nfl', 'nhl', 'ncaab'];
+  const validSports = ['nba', 'nfl', 'nhl', 'ncaab', 'ncaaf'];
   for (const sport of validSports) {
     if (data.sports[sport] && !Array.isArray(data.sports[sport])) {
       return false;

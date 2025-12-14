@@ -231,6 +231,7 @@ function broadcastOddsUpdate(data) {
     if (rawSports?.nfl?.length != null) logger.debug(`[Upstream] nfl events: ${rawSports.nfl.length}`);
     if (rawSports?.nhl?.length != null) logger.debug(`[Upstream] nhl events: ${rawSports.nhl.length}`);
     if (rawSports?.ncaab?.length != null) logger.debug(`[Upstream] ncaab events: ${rawSports.ncaab.length}`);
+    if (rawSports?.ncaaf?.length != null) logger.debug(`[Upstream] ncaaf events: ${rawSports.ncaaf.length}`);
     if (data.openingLines) {
       const openKeys = Object.keys(data.openingLines || {});
       logger.debug(`[Upstream] openingLines present. Keys: ${openKeys.slice(0, 5).join(', ')}${openKeys.length > 5 ? '…' : ''}`);
