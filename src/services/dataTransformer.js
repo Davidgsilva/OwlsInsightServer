@@ -161,10 +161,27 @@ function transformOddsApiFormat(events) {
     'icehockey_nhl': 'nhl',
     'basketball_ncaab': 'ncaab',
     'americanfootball_ncaaf': 'ncaaf',
+    'football_ncaaf': 'ncaaf',
   };
+
+  const debugEnabled = process.env.DEBUG_OWLS_INSIGHT === 'true';
+  if (debugEnabled) {
+    const counts = {};
+    events.forEach((e) => {
+      const key = e?.sport_key || 'missing_sport_key';
+      counts[key] = (counts[key] || 0) + 1;
+    });
+    // eslint-disable-next-line no-console
+    console.log('[DEBUG_OWLS_INSIGHT] OddsAPI sport_key counts:', counts);
+  }
 
   events.forEach((event) => {
     const sportKey = sportKeyMapping[event.sport_key] || event.sport_key;
+
+    if (debugEnabled && !sports[sportKey] && event?.sport_key) {
+      // eslint-disable-next-line no-console
+      console.log('[DEBUG_OWLS_INSIGHT] Unmapped sport_key:', event.sport_key, '->', sportKey);
+    }
 
     if (sports[sportKey]) {
       sports[sportKey].push({

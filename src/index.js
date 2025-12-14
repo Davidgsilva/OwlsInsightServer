@@ -79,12 +79,32 @@ async function fetchCombinedHistory({ eventId, book, market, hours }) {
   };
 
   const [sideA, sideB] = cfg.sides;
+  const urlA = buildUrl(sideA);
+  const urlB = buildUrl(sideB);
   const [respA, respB] = await Promise.all([
-    fetch(buildUrl(sideA), { headers: { 'Authorization': `Bearer ${apiKey}` } }),
-    fetch(buildUrl(sideB), { headers: { 'Authorization': `Bearer ${apiKey}` } }),
+    fetch(urlA, { headers: { 'Authorization': `Bearer ${apiKey}` } }),
+    fetch(urlB, { headers: { 'Authorization': `Bearer ${apiKey}` } }),
   ]);
 
   if (!respA.ok || !respB.ok) {
+    if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+      const [bodyA, bodyB] = await Promise.all([
+        respA.ok ? Promise.resolve('') : respA.text().catch(() => ''),
+        respB.ok ? Promise.resolve('') : respB.text().catch(() => ''),
+      ]);
+      // eslint-disable-next-line no-console
+      console.log('[DEBUG_OWLS_INSIGHT] history fetch failed', {
+        eventId,
+        market: cfg.market,
+        book,
+        urlA,
+        urlB,
+        statusA: respA.status,
+        statusB: respB.status,
+        bodyA: bodyA ? bodyA.slice(0, 300) : '',
+        bodyB: bodyB ? bodyB.slice(0, 300) : '',
+      });
+    }
     const status = `${respA.status}/${respB.status}`;
     throw new Error(`upstream history failed (${status})`);
   }
@@ -236,13 +256,36 @@ function broadcastOddsUpdate(data) {
       const openKeys = Object.keys(data.openingLines || {});
       logger.debug(`[Upstream] openingLines present. Keys: ${openKeys.slice(0, 5).join(', ')}${openKeys.length > 5 ? '…' : ''}`);
     }
+
+    if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+      // eslint-disable-next-line no-console
+      console.log('[DEBUG_OWLS_INSIGHT] broadcastOddsUpdate sports counts:', {
+        nba: rawSports?.nba?.length ?? null,
+        ncaab: rawSports?.ncaab?.length ?? null,
+        ncaaf: rawSports?.ncaaf?.length ?? null,
+        nfl: rawSports?.nfl?.length ?? null,
+        nhl: rawSports?.nhl?.length ?? null,
+        keys: sportKeys,
+      });
+    }
   } catch (e) {
     logger.warn(`[Upstream] debug log failed: ${e.message}`);
   }
 
-  latestOddsData = data.sports || data;
-  if (data.openingLines) {
-    openingLines = data.openingLines;
+  // Some upstream payloads may be partial (only a subset of sports).
+  // Merge into cached state so the frontend doesn't "lose" a sport between updates.
+  const incomingSports = data.sports || data;
+  if (incomingSports && typeof incomingSports === 'object' && !Array.isArray(incomingSports)) {
+    const prev = (latestOddsData && typeof latestOddsData === 'object' && !Array.isArray(latestOddsData))
+      ? latestOddsData
+      : {};
+    latestOddsData = { ...prev, ...incomingSports };
+  } else {
+    latestOddsData = incomingSports;
+  }
+
+  if (data.openingLines && typeof data.openingLines === 'object') {
+    openingLines = { ...(openingLines || {}), ...data.openingLines };
   }
 
   const payload = {
@@ -251,8 +294,76 @@ function broadcastOddsUpdate(data) {
     timestamp: new Date().toISOString(),
   };
 
+  // Fire-and-forget debug probe
+  debugProbeHistory(payload.sports);
+
+  if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+    const keys = payload.sports && typeof payload.sports === 'object' ? Object.keys(payload.sports) : [];
+    // eslint-disable-next-line no-console
+    console.log('[DEBUG_OWLS_INSIGHT] payload sports keys after merge:', keys);
+    // eslint-disable-next-line no-console
+    console.log('[DEBUG_OWLS_INSIGHT] payload counts after merge:', {
+      nba: payload.sports?.nba?.length ?? null,
+      ncaab: payload.sports?.ncaab?.length ?? null,
+      ncaaf: payload.sports?.ncaaf?.length ?? null,
+      nfl: payload.sports?.nfl?.length ?? null,
+      nhl: payload.sports?.nhl?.length ?? null,
+    });
+  }
+
   io.emit('odds-update', payload);
   logger.info(`Broadcasted odds update to ${io.engine.clientsCount} clients`);
+}
+
+// -----------------------------------------------------------------------------
+// Optional debug probe: verify history endpoint returns rows for a sample game
+// -----------------------------------------------------------------------------
+let didHistoryProbe = false;
+async function debugProbeHistory(latestSports) {
+  if (didHistoryProbe || process.env.DEBUG_OWLS_INSIGHT !== 'true') return;
+  if (!latestSports || typeof latestSports !== 'object') return;
+
+  const pick = (key) => Array.isArray(latestSports[key]) && latestSports[key].length > 0 ? latestSports[key][0] : null;
+  const sample =
+    pick('ncaaf') ||
+    pick('nfl') ||
+    pick('nba') ||
+    pick('nhl') ||
+    pick('ncaab');
+  if (!sample) return;
+
+  const sampleSport = sample.sport || sample.sport_key || 'unknown';
+  const sampleId = sample.eventId || sample.id || sample.event_id;
+  if (!sampleId) return;
+
+  didHistoryProbe = true;
+  const book = 'pinnacle';
+  const market = 'spreads';
+
+  // eslint-disable-next-line no-console
+  console.log('[DEBUG_OWLS_INSIGHT] probing history for sample game', {
+    sport: sampleSport,
+    id: sampleId,
+    teams: `${sample.away_team || sample.awayTeam} @ ${sample.home_team || sample.homeTeam}`,
+    book,
+    market,
+  });
+
+  try {
+    const resp = await fetchCombinedHistory({ eventId: sampleId, book, market, hours: 24 });
+    const rows = resp?.data?.historyRows || [];
+    const opening = resp?.data?.openingLines || null;
+    // eslint-disable-next-line no-console
+    console.log('[DEBUG_OWLS_INSIGHT] history probe result', {
+      rows: rows.length,
+      firstTs: rows[0]?.timestamp || null,
+      lastTs: rows[rows.length - 1]?.timestamp || null,
+      openingKeys: opening ? Object.keys(opening) : null,
+    });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.log('[DEBUG_OWLS_INSIGHT] history probe error:', e.message);
+  }
 }
 
 // Handle downstream client connections (Owls Insight frontend)
@@ -341,6 +452,11 @@ io.on('connection', (socket) => {
   // Send latest data immediately on connect
   if (latestOddsData) {
     logger.debug(`[Downstream] sending cached odds to ${socket.id}`);
+    if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+      const keys = latestOddsData && typeof latestOddsData === 'object' ? Object.keys(latestOddsData) : [];
+      // eslint-disable-next-line no-console
+      console.log('[DEBUG_OWLS_INSIGHT] sending cached odds on connect. keys:', keys);
+    }
     socket.emit('odds-update', {
       sports: latestOddsData,
       openingLines: openingLines,
