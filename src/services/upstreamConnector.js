@@ -20,6 +20,7 @@ class UpstreamConnector {
 
     // Callbacks
     this.onOddsUpdate = options.onOddsUpdate || (() => {});
+    this.onScoresUpdate = options.onScoresUpdate || (() => {});
     this.onConnect = options.onConnect || (() => {});
     this.onDisconnect = options.onDisconnect || (() => {});
     this.onError = options.onError || (() => {});
@@ -134,6 +135,31 @@ class UpstreamConnector {
       } catch (error) {
         logger.error(`Error transforming upstream data: ${error.message}`);
       }
+    });
+
+    // Handle scores update from upstream (live game scores)
+    this.socket.on('scores-update', (data) => {
+      logger.debug(`Received scores-update from upstream`);
+
+      try {
+        const sportsObj = data.sports || {};
+        const liveCounts = {};
+        let totalLive = 0;
+
+        Object.entries(sportsObj).forEach(([sportKey, games]) => {
+          if (Array.isArray(games)) {
+            liveCounts[sportKey] = games.length;
+            totalLive += games.length;
+          }
+        });
+
+        logger.debug(`[Upstream] scores-update: ${totalLive} live games`, liveCounts);
+      } catch (e) {
+        logger.warn(`[Upstream] scores debug failed: ${e.message}`);
+      }
+
+      // Pass through directly (no transformation needed for scores)
+      this.onScoresUpdate(data);
     });
 
     // Handle additional event names if configured

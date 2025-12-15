@@ -200,14 +200,130 @@ app.get('/api/history', async (req, res) => {
   }
 });
 
+// -----------------------------------------------------------------------------
+// Live Scores proxy endpoints
+// -----------------------------------------------------------------------------
+const SCORES_CACHE_TTL_MS = 15 * 1000; // 15 seconds
+let scoresCache = { data: null, timestamp: 0 };
+
+async function fetchLiveScoresFromUpstream(sport = null) {
+  const apiBase = getApiBaseUrl();
+  const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+  if (!apiBase || !apiKey) throw new Error('scores proxy not configured');
+
+  // Check cache first
+  if (scoresCache.data && Date.now() - scoresCache.timestamp < SCORES_CACHE_TTL_MS) {
+    if (sport) {
+      const sportData = scoresCache.data?.data?.sports?.[sport] || [];
+      return {
+        success: true,
+        sport,
+        timestamp: scoresCache.data?.data?.timestamp,
+        count: sportData.length,
+        events: sportData,
+        cached: true,
+      };
+    }
+    return { ...scoresCache.data, cached: true };
+  }
+
+  // Fetch from upstream
+  const url = `${apiBase}/api/v1/scores/live`;
+  const resp = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${apiKey}` },
+    timeout: 10000,
+  });
+
+  if (!resp.ok) {
+    throw new Error(`upstream scores failed (${resp.status})`);
+  }
+
+  const json = await resp.json();
+  scoresCache = { data: json, timestamp: Date.now() };
+
+  if (sport) {
+    const sportData = json?.data?.sports?.[sport] || [];
+    return {
+      success: true,
+      sport,
+      timestamp: json?.data?.timestamp,
+      count: sportData.length,
+      events: sportData,
+      cached: false,
+    };
+  }
+
+  return { ...json, cached: false };
+}
+
+// All sports live scores
+app.get('/api/v1/scores/live', async (req, res) => {
+  try {
+    // First try to return cached data from WebSocket
+    if (latestScoresData) {
+      return res.json({
+        success: true,
+        data: latestScoresData,
+        cached: true,
+      });
+    }
+
+    // Fall back to upstream API
+    const data = await fetchLiveScoresFromUpstream();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`Scores proxy error: ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch scores' });
+  }
+});
+
+// Sport-specific live scores
+const VALID_SPORTS = ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'];
+app.get('/api/v1/:sport/scores/live', async (req, res) => {
+  const { sport } = req.params;
+
+  if (!VALID_SPORTS.includes(sport)) {
+    return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
+  }
+
+  try {
+    // First try to return cached data from WebSocket
+    if (latestScoresData) {
+      const sportData = latestScoresData.sports?.[sport] || [];
+      return res.json({
+        success: true,
+        sport,
+        timestamp: latestScoresData.timestamp,
+        count: sportData.length,
+        events: sportData,
+        cached: true,
+      });
+    }
+
+    // Fall back to upstream API
+    const data = await fetchLiveScoresFromUpstream(sport);
+    return res.json(data);
+  } catch (err) {
+    logger.error(`Scores proxy error (${sport}): ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch scores' });
+  }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
+  const liveGameCount = latestScoresData
+    ? Object.values(latestScoresData.sports || {}).flat().length
+    : 0;
+
   res.json({
     status: 'ok',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     connections: io.engine.clientsCount,
     upstreamConnected: upstreamConnector?.isConnected() || false,
+    liveGames: liveGameCount,
+    hasOddsData: !!latestOddsData,
+    hasScoresData: !!latestScoresData,
   });
 });
 
@@ -237,6 +353,9 @@ const io = new Server(server, {
 // Store latest odds data for new connections
 let latestOddsData = null;
 let openingLines = {};
+
+// Store latest live scores data for new connections
+let latestScoresData = null;
 
 // Initialize upstream connector
 let upstreamConnector = null;
@@ -313,6 +432,37 @@ function broadcastOddsUpdate(data) {
 
   io.emit('odds-update', payload);
   logger.info(`Broadcasted odds update to ${io.engine.clientsCount} clients`);
+}
+
+// Broadcast live scores update to all connected clients
+function broadcastScoresUpdate(data) {
+  try {
+    const sportsObj = data.sports || {};
+    const liveCounts = {};
+    let totalLive = 0;
+
+    Object.entries(sportsObj).forEach(([sportKey, games]) => {
+      if (Array.isArray(games)) {
+        liveCounts[sportKey] = games.length;
+        totalLive += games.length;
+      }
+    });
+
+    logger.debug(`[Upstream] scores-update received. Total live: ${totalLive}`, liveCounts);
+  } catch (e) {
+    logger.warn(`[Upstream] scores debug log failed: ${e.message}`);
+  }
+
+  // Cache for new connections
+  latestScoresData = data;
+
+  const payload = {
+    sports: data.sports || {},
+    timestamp: data.timestamp || new Date().toISOString(),
+  };
+
+  io.emit('scores-update', payload);
+  logger.info(`Broadcasted scores update to ${io.engine.clientsCount} clients (${Object.values(payload.sports).flat().length} live games)`);
 }
 
 // -----------------------------------------------------------------------------
@@ -465,6 +615,16 @@ io.on('connection', (socket) => {
     logger.debug(`Sent cached odds to new client: ${socket.id}`);
   }
 
+  // Send latest live scores immediately on connect
+  if (latestScoresData) {
+    logger.debug(`[Downstream] sending cached scores to ${socket.id}`);
+    socket.emit('scores-update', {
+      sports: latestScoresData.sports || {},
+      timestamp: latestScoresData.timestamp || new Date().toISOString(),
+    });
+    logger.debug(`Sent cached scores to new client: ${socket.id}`);
+  }
+
   // Handle manual refresh request from client
   socket.on('request-odds', () => {
     logger.debug(`Client ${socket.id} requested odds refresh`);
@@ -474,6 +634,18 @@ io.on('connection', (socket) => {
         sports: latestOddsData,
         openingLines: openingLines,
         timestamp: new Date().toISOString(),
+      });
+    }
+  });
+
+  // Handle manual scores refresh request from client
+  socket.on('request-scores', () => {
+    logger.debug(`Client ${socket.id} requested scores refresh`);
+    if (latestScoresData) {
+      logger.debug(`[Downstream] re-sending cached scores to ${socket.id}`);
+      socket.emit('scores-update', {
+        sports: latestScoresData.sports || {},
+        timestamp: latestScoresData.timestamp || new Date().toISOString(),
       });
     }
   });
@@ -499,6 +671,7 @@ server.listen(PORT, () => {
   // TODO: Create the connection to the upstream odds provider server
   upstreamConnector = new UpstreamConnector({
     onOddsUpdate: broadcastOddsUpdate,
+    onScoresUpdate: broadcastScoresUpdate,
     onConnect: () => logger.info('Upstream connected'),
     onDisconnect: (reason) => logger.warn(`Upstream disconnected: ${reason}`),
     onError: (error) => logger.error(`Upstream error: ${error.message}`),
