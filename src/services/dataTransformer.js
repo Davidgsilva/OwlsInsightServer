@@ -118,8 +118,24 @@ function addAveragesToSports(sports) {
  * @returns {Object} - Transformed data for Owls Insight
  */
 function transformUpstreamData(upstreamData) {
+  const debugEnabled = process.env.DEBUG_OWLS_INSIGHT === 'true';
+
+  // DEBUG: Log what we're transforming
+  if (debugEnabled) {
+    console.log('\n========== DATA TRANSFORMER DEBUG ==========');
+    console.log('Input data keys:', Object.keys(upstreamData || {}));
+    console.log('Has sports?', !!upstreamData?.sports);
+    console.log('Has openingLines?', !!upstreamData?.openingLines);
+    console.log('Is array?', Array.isArray(upstreamData));
+  }
+
   // If data is already in correct format, add averages and return
   if (upstreamData.sports && typeof upstreamData.sports === 'object') {
+    if (debugEnabled) {
+      console.log('Path: sports object format - preserving openingLines');
+      console.log('openingLines keys:', Object.keys(upstreamData.openingLines || {}).length);
+      console.log('=============================================\n');
+    }
     return {
       ...upstreamData,
       sports: addAveragesToSports(upstreamData.sports)
@@ -128,6 +144,10 @@ function transformUpstreamData(upstreamData) {
 
   // If upstream sends data in The Odds API format
   if (Array.isArray(upstreamData)) {
+    if (debugEnabled) {
+      console.log('Path: OddsAPI array format - openingLines will be empty');
+      console.log('=============================================\n');
+    }
     return transformOddsApiFormat(upstreamData);
   }
 
@@ -135,6 +155,10 @@ function transformUpstreamData(upstreamData) {
   // Add more transformers as needed based on your upstream format
 
   // Default: wrap in sports object
+  if (debugEnabled) {
+    console.log('Path: default wrap - openingLines will be empty');
+    console.log('=============================================\n');
+  }
   return {
     sports: upstreamData,
     openingLines: {},

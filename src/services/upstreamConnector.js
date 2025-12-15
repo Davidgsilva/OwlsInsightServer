@@ -93,6 +93,25 @@ class UpstreamConnector {
     this.socket.on(this.upstreamEventName, (data) => {
       logger.debug(`Received odds update from upstream`);
 
+      // DEBUG: Check for openingLines in raw upstream data
+      if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+        console.log('\n========== OPENING LINES DEBUG ==========');
+        console.log('Raw data keys:', Object.keys(data || {}));
+        console.log('Has openingLines?', !!data?.openingLines);
+        if (data?.openingLines) {
+          const keys = Object.keys(data.openingLines);
+          console.log('openingLines key count:', keys.length);
+          console.log('Sample openingLines keys (first 5):', keys.slice(0, 5));
+          if (keys.length > 0) {
+            const sampleKey = keys[0];
+            console.log(`Sample openingLines[${sampleKey}]:`, JSON.stringify(data.openingLines[sampleKey], null, 2));
+          }
+        } else {
+          console.log('openingLines is:', data?.openingLines);
+        }
+        console.log('==========================================\n');
+      }
+
       // Generic debug sampling for payload shape (safe, small)
       try {
         const sportsObj = data.sports || {};
