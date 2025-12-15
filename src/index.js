@@ -360,6 +360,131 @@ let latestScoresData = null;
 // Initialize upstream connector
 let upstreamConnector = null;
 
+// -----------------------------------------------------------------------------
+// Live score merge helpers
+// -----------------------------------------------------------------------------
+
+function normalizeTeamKey(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function getEventKey(event) {
+  return event?.eventId || event?.id || event?.event_id || event?.eventID || null;
+}
+
+function getHomeAwayNames(event) {
+  return {
+    home: event?.home_team || event?.homeTeam || event?.home?.name || event?.home?.team || null,
+    away: event?.away_team || event?.awayTeam || event?.away?.name || event?.away?.team || null,
+  };
+}
+
+function getHomeAwayScores(event) {
+  const rawHome =
+    event?.home_score ??
+    event?.homeScore ??
+    event?.home?.score ??
+    event?.score?.home ??
+    null;
+  const rawAway =
+    event?.away_score ??
+    event?.awayScore ??
+    event?.away?.score ??
+    event?.score?.away ??
+    null;
+
+  const home = rawHome == null ? null : Number(rawHome);
+  const away = rawAway == null ? null : Number(rawAway);
+
+  return {
+    home: Number.isFinite(home) ? home : null,
+    away: Number.isFinite(away) ? away : null,
+  };
+}
+
+function buildTeamsKey(away, home) {
+  const a = normalizeTeamKey(away);
+  const h = normalizeTeamKey(home);
+  if (!a || !h) return null;
+  return `${a}@${h}`;
+}
+
+function buildScoreIndex(scoresData) {
+  const byId = new Map();
+  const byTeams = new Map();
+
+  if (!scoresData || typeof scoresData !== 'object') return { byId, byTeams };
+
+  const sportBuckets = scoresData.sports || scoresData.data?.sports || {};
+  Object.values(sportBuckets).forEach((events) => {
+    if (!Array.isArray(events)) return;
+    events.forEach((ev) => {
+      const id = getEventKey(ev);
+      const { home, away } = getHomeAwayNames(ev);
+      const scores = getHomeAwayScores(ev);
+      const teamsKey = buildTeamsKey(away, home);
+
+      const normalized = {
+        id,
+        home,
+        away,
+        home_score: scores.home,
+        away_score: scores.away,
+        detail: ev?.detail || ev?.status_detail || ev?.statusDetail || null,
+        clock: ev?.clock || ev?.displayClock || null,
+        period: ev?.period ?? null,
+        updatedAt: ev?.timestamp || ev?.updatedAt || ev?.updated_at || null,
+      };
+
+      if (id) byId.set(String(id), normalized);
+      if (teamsKey) byTeams.set(teamsKey, normalized);
+    });
+  });
+
+  return { byId, byTeams };
+}
+
+function mergeScoresIntoSports(sports, scoresData) {
+  if (!sports || typeof sports !== 'object') return sports;
+  if (!scoresData || typeof scoresData !== 'object') return sports;
+
+  const { byId, byTeams } = buildScoreIndex(scoresData);
+  if (byId.size === 0 && byTeams.size === 0) return sports;
+
+  const next = { ...sports };
+  Object.entries(next).forEach(([sportKey, events]) => {
+    if (!Array.isArray(events)) return;
+
+    next[sportKey] = events.map((ev) => {
+      const id = getEventKey(ev);
+      const { home, away } = getHomeAwayNames(ev);
+      const matchKey = buildTeamsKey(away, home);
+
+      const score =
+        (id && byId.get(String(id))) ||
+        (matchKey ? byTeams.get(matchKey) : null) ||
+        null;
+
+      if (!score) return ev;
+      if (score.home_score == null && score.away_score == null) return ev;
+
+      return {
+        ...ev,
+        home_score: score.home_score,
+        away_score: score.away_score,
+        score_clock: score.clock,
+        score_period: score.period,
+        score_detail: score.detail,
+        score_updated_at: score.updatedAt,
+      };
+    });
+  });
+
+  return next;
+}
+
 // Broadcast odds update to all connected clients
 function broadcastOddsUpdate(data) {
   try {
@@ -407,8 +532,9 @@ function broadcastOddsUpdate(data) {
     openingLines = { ...(openingLines || {}), ...data.openingLines };
   }
 
+  const sportsWithScores = mergeScoresIntoSports(latestOddsData, latestScoresData);
   const payload = {
-    sports: latestOddsData,
+    sports: sportsWithScores,
     openingLines: openingLines,
     timestamp: new Date().toISOString(),
   };
@@ -608,7 +734,7 @@ io.on('connection', (socket) => {
       console.log('[DEBUG_OWLS_INSIGHT] sending cached odds on connect. keys:', keys);
     }
     socket.emit('odds-update', {
-      sports: latestOddsData,
+      sports: mergeScoresIntoSports(latestOddsData, latestScoresData),
       openingLines: openingLines,
       timestamp: new Date().toISOString(),
     });
@@ -631,7 +757,7 @@ io.on('connection', (socket) => {
     if (latestOddsData) {
       logger.debug(`[Downstream] re-sending cached odds to ${socket.id}`);
       socket.emit('odds-update', {
-        sports: latestOddsData,
+        sports: mergeScoresIntoSports(latestOddsData, latestScoresData),
         openingLines: openingLines,
         timestamp: new Date().toISOString(),
       });
