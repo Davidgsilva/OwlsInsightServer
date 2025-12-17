@@ -310,17 +310,22 @@ app.get('/api/v1/:sport/scores/live', async (req, res) => {
 });
 
 // Health check endpoint
+// Returns 503 if upstream is disconnected so K8s will restart the pod
 app.get('/health', (req, res) => {
   const liveGameCount = latestScoresData
     ? Object.values(latestScoresData.sports || {}).flat().length
     : 0;
 
-  res.json({
-    status: 'ok',
+  const isUpstreamConnected = upstreamConnector?.isConnected() || false;
+  const status = isUpstreamConnected ? 'ok' : 'unhealthy';
+  const httpStatus = isUpstreamConnected ? 200 : 503;
+
+  res.status(httpStatus).json({
+    status,
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     connections: io.engine.clientsCount,
-    upstreamConnected: upstreamConnector?.isConnected() || false,
+    upstreamConnected: isUpstreamConnected,
     liveGames: liveGameCount,
     hasOddsData: !!latestOddsData,
     hasScoresData: !!latestScoresData,
