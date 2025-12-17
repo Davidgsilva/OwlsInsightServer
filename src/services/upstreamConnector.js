@@ -130,24 +130,6 @@ class UpstreamConnector {
         logger.warn(`[Upstream] sampling failed: ${e.message}`);
       }
 
-      // DEBUG: Look for specific games (Carolina, Bakersfield)
-      if (data.sports?.ncaab) {
-        console.log('\n========== NCAAB GAMES - Looking for Carolina/Bakersfield ==========');
-        data.sports.ncaab.forEach((game, i) => {
-          const teams = `${game.away_team} @ ${game.home_team}`;
-          const isTarget = teams.toLowerCase().includes('carolina') ||
-                          teams.toLowerCase().includes('bakersfield');
-          if (isTarget) {
-            console.log(`\nGAME: ${teams}`);
-            console.log('  commence_time:', game.commence_time);
-            console.log('  status:', game.status);
-            console.log('  bookmakers:', game.bookmakers?.map(b => b.key).join(', ') || 'none');
-          }
-        });
-        console.log('\nTotal NCAAB games:', data.sports.ncaab.length);
-        console.log('==================================================================\n');
-      }
-
       try {
         const transformedData = transformUpstreamData(data);
         this.onOddsUpdate(transformedData);
