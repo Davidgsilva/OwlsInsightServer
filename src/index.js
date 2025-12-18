@@ -419,8 +419,9 @@ function buildTeamsKey(away, home) {
 function buildScoreIndex(scoresData) {
   const byId = new Map();
   const byTeams = new Map();
+  const allScores = []; // For fuzzy matching fallback
 
-  if (!scoresData || typeof scoresData !== 'object') return { byId, byTeams };
+  if (!scoresData || typeof scoresData !== 'object') return { byId, byTeams, allScores };
 
   const sportBuckets = scoresData.sports || scoresData.data?.sports || {};
   Object.values(sportBuckets).forEach((events) => {
@@ -435,6 +436,8 @@ function buildScoreIndex(scoresData) {
         id,
         home,
         away,
+        homeKey: normalizeTeamKey(home),
+        awayKey: normalizeTeamKey(away),
         home_score: scores.home,
         away_score: scores.away,
         detail: ev?.detail || ev?.status_detail || ev?.statusDetail || null,
@@ -445,10 +448,28 @@ function buildScoreIndex(scoresData) {
 
       if (id) byId.set(String(id), normalized);
       if (teamsKey) byTeams.set(teamsKey, normalized);
+      allScores.push(normalized);
     });
   });
 
-  return { byId, byTeams };
+  return { byId, byTeams, allScores };
+}
+
+// Fuzzy match: check if odds team names are prefixes of (or match) score team names
+function fuzzyMatchScore(oddsHome, oddsAway, allScores) {
+  const oh = normalizeTeamKey(oddsHome);
+  const oa = normalizeTeamKey(oddsAway);
+  if (!oh || !oa) return null;
+
+  for (const score of allScores) {
+    // Check if odds team names are prefixes of score team names (handles "Delaware" vs "Delaware Blue Hens")
+    const homeMatches = score.homeKey.startsWith(oh) || oh.startsWith(score.homeKey);
+    const awayMatches = score.awayKey.startsWith(oa) || oa.startsWith(score.awayKey);
+    if (homeMatches && awayMatches) {
+      return score;
+    }
+  }
+  return null;
 }
 
 function mergeScoresIntoSports(sports, scoresData) {
@@ -460,12 +481,13 @@ function mergeScoresIntoSports(sports, scoresData) {
     return sports;
   }
 
-  const { byId, byTeams } = buildScoreIndex(scoresData);
+  const { byId, byTeams, allScores } = buildScoreIndex(scoresData);
 
   if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
     console.log('[DEBUG_OWLS_INSIGHT] Score index built:', {
       byIdSize: byId.size,
       byTeamsSize: byTeams.size,
+      allScoresCount: allScores.length,
       sampleByIdKeys: Array.from(byId.keys()).slice(0, 3),
       sampleByTeamsKeys: Array.from(byTeams.keys()).slice(0, 3),
     });
@@ -475,6 +497,7 @@ function mergeScoresIntoSports(sports, scoresData) {
 
   const next = { ...sports };
   let matchedCount = 0;
+  let fuzzyMatchedCount = 0;
   let unmatchedLiveCount = 0;
 
   Object.entries(next).forEach(([sportKey, events]) => {
@@ -485,10 +508,18 @@ function mergeScoresIntoSports(sports, scoresData) {
       const { home, away } = getHomeAwayNames(ev);
       const matchKey = buildTeamsKey(away, home);
 
-      const score =
+      // Try exact ID match, then exact team key match, then fuzzy team name match
+      let score =
         (id && byId.get(String(id))) ||
         (matchKey ? byTeams.get(matchKey) : null) ||
         null;
+
+      // Fuzzy matching fallback for partial team names (e.g., "Delaware" vs "Delaware Blue Hens")
+      let wasFuzzyMatch = false;
+      if (!score && home && away) {
+        score = fuzzyMatchScore(home, away, allScores);
+        if (score) wasFuzzyMatch = true;
+      }
 
       if (!score) {
         // Log unmatched live events for debugging
@@ -508,6 +539,7 @@ function mergeScoresIntoSports(sports, scoresData) {
       if (score.home_score == null && score.away_score == null) return ev;
 
       matchedCount++;
+      if (wasFuzzyMatch) fuzzyMatchedCount++;
       return {
         ...ev,
         home_score: score.home_score,
@@ -521,7 +553,7 @@ function mergeScoresIntoSports(sports, scoresData) {
   });
 
   if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
-    console.log('[DEBUG_OWLS_INSIGHT] Score merge result:', { matchedCount, unmatchedLiveCount });
+    console.log('[DEBUG_OWLS_INSIGHT] Score merge result:', { matchedCount, fuzzyMatchedCount, unmatchedLiveCount });
   }
 
   return next;
