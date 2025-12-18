@@ -381,8 +381,8 @@ function getEventKey(event) {
 
 function getHomeAwayNames(event) {
   return {
-    home: event?.home_team || event?.homeTeam || event?.home?.name || event?.home?.team || null,
-    away: event?.away_team || event?.awayTeam || event?.away?.name || event?.away?.team || null,
+    home: event?.home_team || event?.homeTeam || event?.home?.name || event?.home?.team?.displayName || null,
+    away: event?.away_team || event?.awayTeam || event?.away?.name || event?.away?.team?.displayName || null,
   };
 }
 
@@ -453,12 +453,30 @@ function buildScoreIndex(scoresData) {
 
 function mergeScoresIntoSports(sports, scoresData) {
   if (!sports || typeof sports !== 'object') return sports;
-  if (!scoresData || typeof scoresData !== 'object') return sports;
+  if (!scoresData || typeof scoresData !== 'object') {
+    if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+      console.log('[DEBUG_OWLS_INSIGHT] mergeScoresIntoSports: No scoresData available');
+    }
+    return sports;
+  }
 
   const { byId, byTeams } = buildScoreIndex(scoresData);
+
+  if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+    console.log('[DEBUG_OWLS_INSIGHT] Score index built:', {
+      byIdSize: byId.size,
+      byTeamsSize: byTeams.size,
+      sampleByIdKeys: Array.from(byId.keys()).slice(0, 3),
+      sampleByTeamsKeys: Array.from(byTeams.keys()).slice(0, 3),
+    });
+  }
+
   if (byId.size === 0 && byTeams.size === 0) return sports;
 
   const next = { ...sports };
+  let matchedCount = 0;
+  let unmatchedLiveCount = 0;
+
   Object.entries(next).forEach(([sportKey, events]) => {
     if (!Array.isArray(events)) return;
 
@@ -472,9 +490,24 @@ function mergeScoresIntoSports(sports, scoresData) {
         (matchKey ? byTeams.get(matchKey) : null) ||
         null;
 
-      if (!score) return ev;
+      if (!score) {
+        // Log unmatched live events for debugging
+        if (process.env.DEBUG_OWLS_INSIGHT === 'true' && ev.status === 'live' && unmatchedLiveCount < 3) {
+          unmatchedLiveCount++;
+          console.log('[DEBUG_OWLS_INSIGHT] Unmatched live event:', {
+            sport: sportKey,
+            id,
+            matchKey,
+            home,
+            away,
+            status: ev.status,
+          });
+        }
+        return ev;
+      }
       if (score.home_score == null && score.away_score == null) return ev;
 
+      matchedCount++;
       return {
         ...ev,
         home_score: score.home_score,
@@ -486,6 +519,10 @@ function mergeScoresIntoSports(sports, scoresData) {
       };
     });
   });
+
+  if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+    console.log('[DEBUG_OWLS_INSIGHT] Score merge result:', { matchedCount, unmatchedLiveCount });
+  }
 
   return next;
 }
@@ -580,6 +617,26 @@ function broadcastScoresUpdate(data) {
     });
 
     logger.debug(`[Upstream] scores-update received. Total live: ${totalLive}`, liveCounts);
+
+    // Debug: Log sample score data to verify format
+    if (process.env.DEBUG_OWLS_INSIGHT === 'true' && totalLive > 0) {
+      const sampleSport = Object.keys(sportsObj).find(k => sportsObj[k]?.length > 0);
+      if (sampleSport) {
+        const sample = sportsObj[sampleSport][0];
+        console.log('[DEBUG_OWLS_INSIGHT] Sample score event:', {
+          sport: sampleSport,
+          eventId: sample?.eventId || sample?.id || sample?.event_id,
+          homeTeam: sample?.home_team || sample?.homeTeam || sample?.home?.name,
+          awayTeam: sample?.away_team || sample?.awayTeam || sample?.away?.name,
+          homeScore: sample?.home_score ?? sample?.homeScore ?? sample?.home?.score ?? sample?.score?.home,
+          awayScore: sample?.away_score ?? sample?.awayScore ?? sample?.away?.score ?? sample?.score?.away,
+          allKeys: Object.keys(sample || {}),
+          // Log raw home/away objects to see actual structure
+          rawHome: sample?.home,
+          rawAway: sample?.away,
+        });
+      }
+    }
   } catch (e) {
     logger.warn(`[Upstream] scores debug log failed: ${e.message}`);
   }
