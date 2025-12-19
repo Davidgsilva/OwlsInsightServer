@@ -369,10 +369,51 @@ let upstreamConnector = null;
 // Live score merge helpers
 // -----------------------------------------------------------------------------
 
+// Team name alias mapping for NCAAB/NCAAF teams with different names across sources
+// Maps normalized aliases to canonical normalized key
+const TEAM_ALIASES = {
+  // University of Missouri-Kansas City
+  umkc: 'kansascity',
+  missourikansascity: 'kansascity',
+  // Saint/St variations
+  stpeters: 'saintpeters',
+  stjohns: 'saintjohns',
+  stmarys: 'saintmarys',
+  stbonaventure: 'saintbonaventure',
+  stfrancis: 'saintfrancis',
+  stthomas: 'saintthomas',
+  stjosephs: 'saintjosephs',
+  stlouis: 'saintlouis',
+  // USC variations
+  usc: 'southerncalifornia',
+  southerncal: 'southerncalifornia',
+  // UConn variations
+  uconn: 'connecticut',
+  // SMU variations
+  smu: 'southernmethodist',
+  // TCU variations
+  tcu: 'texaschristian',
+  // UCF variations
+  ucf: 'centralflorida',
+  // LSU variations
+  lsu: 'louisianastate',
+  // Ole Miss variations
+  olemiss: 'mississippi',
+  // UNLV variations
+  unlv: 'nevadalasvegas',
+  // VCU variations
+  vcu: 'virginiacommonwealth',
+  // UNC variations
+  unc: 'northcarolina',
+  // Add more aliases as discovered
+};
+
 function normalizeTeamKey(name) {
-  return String(name || '')
+  const normalized = String(name || '')
     .toLowerCase()
     .replace(/[^a-z0-9]/g, '');
+  // Apply alias mapping if exists
+  return TEAM_ALIASES[normalized] || normalized;
 }
 
 function getEventKey(event) {
@@ -467,6 +508,18 @@ function fuzzyMatchScore(oddsHome, oddsAway, allScores) {
     const awayMatches = score.awayKey.startsWith(oa) || oa.startsWith(score.awayKey);
     if (homeMatches && awayMatches) {
       return score;
+    }
+
+    // Also check if home/away are swapped (sportsbooks sometimes have venue wrong)
+    const homeMatchesAway = score.awayKey.startsWith(oh) || oh.startsWith(score.awayKey);
+    const awayMatchesHome = score.homeKey.startsWith(oa) || oa.startsWith(score.homeKey);
+    if (homeMatchesAway && awayMatchesHome) {
+      // Return with scores swapped to match odds home/away
+      return {
+        ...score,
+        home_score: score.away_score,
+        away_score: score.home_score,
+      };
     }
   }
   return null;

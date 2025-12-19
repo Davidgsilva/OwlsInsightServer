@@ -1,6 +1,6 @@
 {
   "name": "owls-insight-server",
-  "version": "1.0.0",
+  "version": "1.0.5",
   "description": "WebSocket proxy server for Owls Insight - real-time odds aggregation",
   "main": "src/index.js",
   "scripts": {
