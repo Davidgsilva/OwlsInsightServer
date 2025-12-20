@@ -522,6 +522,26 @@ function fuzzyMatchScore(oddsHome, oddsAway, allScores) {
       };
     }
   }
+
+  // Single-team unique match fallback:
+  // If one team matches exactly and there's only ONE score with that team, it's safe to match
+  // This handles cases where odds provider has wrong opponent name (e.g., "California" instead of "UC Irvine")
+  const awayMatches = allScores.filter(s => s.awayKey.startsWith(oa) || oa.startsWith(s.awayKey));
+  if (awayMatches.length === 1) {
+    if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+      console.log(`[DEBUG_OWLS_INSIGHT] Single-team match (away): ${oddsAway} → ${awayMatches[0].away} @ ${awayMatches[0].home}`);
+    }
+    return awayMatches[0];
+  }
+
+  const homeMatches = allScores.filter(s => s.homeKey.startsWith(oh) || oh.startsWith(s.homeKey));
+  if (homeMatches.length === 1) {
+    if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+      console.log(`[DEBUG_OWLS_INSIGHT] Single-team match (home): ${oddsHome} → ${homeMatches[0].away} @ ${homeMatches[0].home}`);
+    }
+    return homeMatches[0];
+  }
+
   return null;
 }
 

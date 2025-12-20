@@ -16,7 +16,7 @@ npm run dev
 Edit `.env`:
 
 ```
-UPSTREAM_WS_URL=http://k8s-owlsinsi-owlsinsi-67f6aee9f8-724108586.us-east-1.elb.amazonaws.com
+UPSTREAM_WS_URL=https://ws.owlsinsight.com
 OWLS_INSIGHT_SERVER_API_KEY=your_api_key_here
 PORT=3001
 ```
