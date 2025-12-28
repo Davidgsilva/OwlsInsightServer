@@ -21,6 +21,7 @@ class UpstreamConnector {
     // Callbacks
     this.onOddsUpdate = options.onOddsUpdate || (() => {});
     this.onScoresUpdate = options.onScoresUpdate || (() => {});
+    this.onPropsUpdate = options.onPropsUpdate || (() => {});
     this.onConnect = options.onConnect || (() => {});
     this.onDisconnect = options.onDisconnect || (() => {});
     this.onError = options.onError || (() => {});
@@ -81,12 +82,18 @@ class UpstreamConnector {
       logger.info('Connected to upstream WebSocket server');
       this.onConnect();
 
-      // Subscribe to all sports and books
+      // Subscribe to all sports and books for odds
       this.socket.emit('subscribe', {
         sports: ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'],
         books: ['pinnacle', 'fanduel', 'draftkings', 'betmgm', 'bet365'],
       });
       logger.info('Sent subscription request for all sports and books');
+
+      // Subscribe to player props (requires Pro/Enterprise tier on upstream)
+      this.socket.emit('subscribe-props', {
+        sports: ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'],
+      });
+      logger.info('Sent props subscription request for all sports');
     });
 
     // Handle odds update from upstream
@@ -163,6 +170,36 @@ class UpstreamConnector {
       this.onScoresUpdate(data);
     });
 
+    // Handle player props update from upstream
+    this.socket.on('player-props-update', (data) => {
+      logger.debug(`Received player-props-update from upstream`);
+
+      try {
+        const sportsObj = data.sports || {};
+        const propsCounts = {};
+        let totalGames = 0;
+
+        Object.entries(sportsObj).forEach(([sportKey, games]) => {
+          if (Array.isArray(games)) {
+            propsCounts[sportKey] = games.length;
+            totalGames += games.length;
+          }
+        });
+
+        logger.debug(`[Upstream] player-props-update: ${totalGames} games with props`, propsCounts);
+      } catch (e) {
+        logger.warn(`[Upstream] props debug failed: ${e.message}`);
+      }
+
+      // Pass through directly (no transformation needed for props)
+      this.onPropsUpdate(data);
+    });
+
+    // Handle props subscription confirmation
+    this.socket.on('props-subscribed', (subscription) => {
+      logger.info(`Props subscription confirmed: ${JSON.stringify(subscription)}`);
+    });
+
     // Handle additional event names if configured
     const additionalEvents = process.env.UPSTREAM_ADDITIONAL_EVENTS?.split(',') || [];
     additionalEvents.forEach((eventName) => {
@@ -198,9 +235,11 @@ class UpstreamConnector {
       }
     });
 
-    // Handle general errors
+    // Handle general errors (can be Error object or custom { message, code } from server)
     this.socket.on('error', (error) => {
-      logger.error(`Upstream socket error: ${error.message}`);
+      const errorMsg = error?.message || JSON.stringify(error);
+      const errorCode = error?.code || 'UNKNOWN';
+      logger.error(`Upstream socket error [${errorCode}]: ${errorMsg}`);
       this.onError(error);
     });
   }

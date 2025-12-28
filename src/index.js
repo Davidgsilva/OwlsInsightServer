@@ -309,6 +309,104 @@ app.get('/api/v1/:sport/scores/live', async (req, res) => {
   }
 });
 
+// -----------------------------------------------------------------------------
+// Player Props proxy endpoints
+// -----------------------------------------------------------------------------
+
+// Props proxy - fetches from upstream and caches
+app.get('/api/v1/:sport/props', async (req, res) => {
+  const { sport } = req.params;
+  const { game_id, player, category } = req.query;
+
+  if (!VALID_SPORTS.includes(sport)) {
+    return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
+  }
+
+  // First try to return cached data from WebSocket
+  if (latestPropsData) {
+    const sportData = latestPropsData.sports?.[sport] || [];
+    let filteredData = sportData;
+
+    // Apply filters if provided
+    if (game_id) {
+      filteredData = filteredData.filter(g => g.gameId === game_id || g.game_id === game_id);
+    }
+    if (player) {
+      const playerLower = player.toLowerCase();
+      filteredData = filteredData.map(g => ({
+        ...g,
+        books: (g.books || []).map(b => ({
+          ...b,
+          props: (b.props || []).filter(p =>
+            (p.playerName || p.player_name || '').toLowerCase().includes(playerLower)
+          )
+        })).filter(b => b.props.length > 0)
+      })).filter(g => g.books.some(b => b.props.length > 0));
+    }
+    if (category) {
+      const catLower = category.toLowerCase();
+      filteredData = filteredData.map(g => ({
+        ...g,
+        books: (g.books || []).map(b => ({
+          ...b,
+          props: (b.props || []).filter(p =>
+            (p.category || '').toLowerCase() === catLower
+          )
+        })).filter(b => b.props.length > 0)
+      })).filter(g => g.books.some(b => b.props.length > 0));
+    }
+
+    // Count props
+    let propsCount = 0;
+    filteredData.forEach(g => {
+      (g.books || []).forEach(b => {
+        propsCount += (b.props || []).length;
+      });
+    });
+
+    return res.json({
+      success: true,
+      data: filteredData,
+      meta: {
+        sport,
+        timestamp: latestPropsData.timestamp,
+        propsReturned: propsCount,
+        gamesReturned: filteredData.length,
+        cached: true,
+      }
+    });
+  }
+
+  // Fall back to upstream API
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'props proxy not configured' });
+    }
+
+    const params = new URLSearchParams();
+    if (game_id) params.append('game_id', game_id);
+    if (player) params.append('player', player);
+    if (category) params.append('category', category);
+
+    const url = `${apiBase}/api/v1/${sport}/props${params.toString() ? '?' + params.toString() : ''}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`Props proxy error (${sport}): ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch props' });
+  }
+});
+
 // Health check endpoint
 // Returns 503 if upstream is disconnected so K8s will restart the pod
 app.get('/health', (req, res) => {
@@ -329,6 +427,7 @@ app.get('/health', (req, res) => {
     liveGames: liveGameCount,
     hasOddsData: !!latestOddsData,
     hasScoresData: !!latestScoresData,
+    hasPropsData: !!latestPropsData,
   });
 });
 
@@ -361,6 +460,9 @@ let openingLines = {};
 
 // Store latest live scores data for new connections
 let latestScoresData = null;
+
+// Store latest player props data for new connections
+let latestPropsData = null;
 
 // Initialize upstream connector
 let upstreamConnector = null;
@@ -758,6 +860,48 @@ function broadcastScoresUpdate(data) {
   logger.info(`Broadcasted scores update to ${io.engine.clientsCount} clients (${Object.values(payload.sports).flat().length} live games)`);
 }
 
+// Broadcast player props update to all connected clients
+function broadcastPropsUpdate(data) {
+  try {
+    const sportsObj = data.sports || {};
+    const propsCounts = {};
+    let totalGames = 0;
+    let totalProps = 0;
+
+    Object.entries(sportsObj).forEach(([sportKey, games]) => {
+      if (Array.isArray(games)) {
+        propsCounts[sportKey] = games.length;
+        totalGames += games.length;
+        // Count total props across all books for each game
+        games.forEach(game => {
+          if (Array.isArray(game.books)) {
+            game.books.forEach(book => {
+              if (Array.isArray(book.props)) {
+                totalProps += book.props.length;
+              }
+            });
+          }
+        });
+      }
+    });
+
+    logger.debug(`[Upstream] player-props-update received. ${totalProps} props from ${totalGames} games`, propsCounts);
+  } catch (e) {
+    logger.warn(`[Upstream] props debug log failed: ${e.message}`);
+  }
+
+  // Cache for new connections
+  latestPropsData = data;
+
+  const payload = {
+    sports: data.sports || {},
+    timestamp: data.timestamp || new Date().toISOString(),
+  };
+
+  io.emit('player-props-update', payload);
+  logger.info(`Broadcasted props update to ${io.engine.clientsCount} clients`);
+}
+
 // -----------------------------------------------------------------------------
 // Optional debug probe: verify history endpoint returns rows for a sample game
 // -----------------------------------------------------------------------------
@@ -943,6 +1087,18 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Handle manual props refresh request from client
+  socket.on('request-props', () => {
+    logger.debug(`Client ${socket.id} requested props refresh`);
+    if (latestPropsData) {
+      logger.debug(`[Downstream] re-sending cached props to ${socket.id}`);
+      socket.emit('player-props-update', {
+        sports: latestPropsData.sports || {},
+        timestamp: latestPropsData.timestamp || new Date().toISOString(),
+      });
+    }
+  });
+
   // Handle client disconnect
   socket.on('disconnect', (reason) => {
     clearSocketWatchers(socket.id);
@@ -965,6 +1121,7 @@ server.listen(PORT, () => {
   upstreamConnector = new UpstreamConnector({
     onOddsUpdate: broadcastOddsUpdate,
     onScoresUpdate: broadcastScoresUpdate,
+    onPropsUpdate: broadcastPropsUpdate,
     onConnect: () => logger.info('Upstream connected'),
     onDisconnect: (reason) => logger.warn(`Upstream disconnected: ${reason}`),
     onError: (error) => logger.error(`Upstream error: ${error.message}`),
