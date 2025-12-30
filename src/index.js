@@ -231,7 +231,6 @@ async function fetchLiveScoresFromUpstream(sport = null) {
   const url = `${apiBase}/api/v1/scores/live`;
   const resp = await fetch(url, {
     headers: { 'Authorization': `Bearer ${apiKey}` },
-    timeout: 10000,
   });
 
   if (!resp.ok) {
@@ -404,6 +403,213 @@ app.get('/api/v1/:sport/props', async (req, res) => {
   } catch (err) {
     logger.error(`Props proxy error (${sport}): ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch props' });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Bet365 Player Props proxy endpoints
+// -----------------------------------------------------------------------------
+
+// Bet365 Props proxy - fetches from upstream Bet365 props endpoint
+app.get('/api/v1/:sport/props/bet365', async (req, res) => {
+  const { sport } = req.params;
+  const { game_id, player, category } = req.query;
+
+  if (!VALID_SPORTS.includes(sport)) {
+    return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
+  }
+
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'bet365 props proxy not configured' });
+    }
+
+    const params = new URLSearchParams();
+    if (game_id) params.append('game_id', game_id);
+    if (player) params.append('player', player);
+    if (category) params.append('category', category);
+
+    const url = `${apiBase}/api/v1/${sport}/props/bet365${params.toString() ? '?' + params.toString() : ''}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      const errorBody = await resp.text().catch(() => '');
+      logger.error(`Bet365 props upstream failed: ${resp.status} - ${errorBody.slice(0, 200)}`);
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`Bet365 props proxy error (${sport}): ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch bet365 props' });
+  }
+});
+
+// Bet365 Props stats endpoint
+app.get('/api/v1/props/bet365/stats', async (req, res) => {
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'bet365 stats proxy not configured' });
+    }
+
+    const url = `${apiBase}/api/v1/props/bet365/stats`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      const errorBody = await resp.text().catch(() => '');
+      logger.error(`Bet365 props stats upstream failed: ${resp.status} - ${errorBody.slice(0, 200)}`);
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`Bet365 props stats proxy error: ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch bet365 props stats' });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// EV (Expected Value) proxy endpoints
+// -----------------------------------------------------------------------------
+
+// EV proxy - fetches from upstream and caches
+// EV data is included in WebSocket odds broadcasts, so check latestOddsData first
+app.get('/api/v1/:sport/ev', async (req, res) => {
+  const { sport } = req.params;
+  const { eventId, books, min_ev } = req.query;
+
+  if (!VALID_SPORTS.includes(sport)) {
+    return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
+  }
+
+  // Fall back to upstream API (EV requires tier validation on backend)
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'ev proxy not configured' });
+    }
+
+    const params = new URLSearchParams();
+    if (eventId) params.append('eventId', eventId);
+    if (books) params.append('books', books);
+    if (min_ev) params.append('min_ev', min_ev);
+
+    const url = `${apiBase}/api/v1/${sport}/ev${params.toString() ? '?' + params.toString() : ''}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      const errorBody = await resp.text().catch(() => '');
+      logger.error(`EV upstream failed: ${resp.status} - ${errorBody.slice(0, 200)}`);
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`EV proxy error (${sport}): ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch ev data' });
+  }
+});
+
+// EV History proxy - fetches historical EV data from upstream
+app.get('/api/odds/ev/history', async (req, res) => {
+  const { eventId, book, market, side, hours } = req.query;
+
+  // Validate required params
+  if (!eventId || !book || !market || !side) {
+    return res.status(400).json({
+      success: false,
+      error: 'eventId, book, market, and side are required',
+    });
+  }
+
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'ev history proxy not configured' });
+    }
+
+    const params = new URLSearchParams({
+      eventId: String(eventId),
+      book: String(book),
+      market: String(market),
+      side: String(side),
+    });
+    if (hours) params.set('hours', String(hours));
+
+    const url = `${apiBase}/api/odds/ev/history?${params.toString()}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      const errorBody = await resp.text().catch(() => '');
+      logger.error(`EV history upstream failed: ${resp.status} - ${errorBody.slice(0, 200)}`);
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`EV history proxy error: ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch ev history' });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Arbitrage proxy endpoints
+// -----------------------------------------------------------------------------
+
+// Arbitrage proxy - fetches from upstream
+// Arbitrage data is included in WebSocket odds broadcasts
+app.get('/api/v1/:sport/arbitrage', async (req, res) => {
+  const { sport } = req.params;
+  const { min_profit } = req.query;
+
+  if (!VALID_SPORTS.includes(sport)) {
+    return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
+  }
+
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'arbitrage proxy not configured' });
+    }
+
+    const params = new URLSearchParams();
+    if (min_profit) params.append('min_profit', min_profit);
+
+    const url = `${apiBase}/api/v1/${sport}/arbitrage${params.toString() ? '?' + params.toString() : ''}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      const errorBody = await resp.text().catch(() => '');
+      logger.error(`Arbitrage upstream failed: ${resp.status} - ${errorBody.slice(0, 200)}`);
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`Arbitrage proxy error (${sport}): ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch arbitrage data' });
   }
 });
 
