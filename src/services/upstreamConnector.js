@@ -22,6 +22,7 @@ class UpstreamConnector {
     this.onOddsUpdate = options.onOddsUpdate || (() => {});
     this.onScoresUpdate = options.onScoresUpdate || (() => {});
     this.onPropsUpdate = options.onPropsUpdate || (() => {});
+    this.onBet365PropsUpdate = options.onBet365PropsUpdate || (() => {});
     this.onConnect = options.onConnect || (() => {});
     this.onDisconnect = options.onDisconnect || (() => {});
     this.onError = options.onError || (() => {});
@@ -89,11 +90,17 @@ class UpstreamConnector {
       });
       logger.info('Sent subscription request for all sports and books');
 
-      // Subscribe to player props (requires Pro/Enterprise tier on upstream)
+      // Subscribe to Pinnacle player props (requires Pro/Enterprise tier on upstream)
       this.socket.emit('subscribe-props', {
         sports: ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'],
       });
-      logger.info('Sent props subscription request for all sports');
+      logger.info('Sent Pinnacle props subscription request for all sports');
+
+      // Subscribe to Bet365 player props (requires Pro/Enterprise tier on upstream)
+      this.socket.emit('subscribe-bet365-props', {
+        sports: ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'],
+      });
+      logger.info('Sent Bet365 props subscription request for all sports');
     });
 
     // Handle odds update from upstream
@@ -133,6 +140,27 @@ class UpstreamConnector {
             `books=${bookKeys.join(',') || 'none'}`
           );
         });
+
+        // DEBUG: Check for duplicate games (same teams, different IDs)
+        if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+          Object.entries(sportsObj).forEach(([sportKey, games]) => {
+            if (!Array.isArray(games)) return;
+            const seen = new Map();
+            games.forEach(g => {
+              const home = (g.home_team || g.homeTeam || '').toLowerCase().replace(/[^a-z]/g, '');
+              const away = (g.away_team || g.awayTeam || '').toLowerCase().replace(/[^a-z]/g, '');
+              const key = `${away}@${home}`;
+              if (seen.has(key)) {
+                const prev = seen.get(key);
+                console.log(`\n⚠️  DUPLICATE GAME DETECTED (${sportKey}):`);
+                console.log(`   Game 1: id=${prev.id || prev.eventId} "${prev.away_team || prev.awayTeam}" @ "${prev.home_team || prev.homeTeam}"`);
+                console.log(`   Game 2: id=${g.id || g.eventId} "${g.away_team || g.awayTeam}" @ "${g.home_team || g.homeTeam}"`);
+              } else {
+                seen.set(key, g);
+              }
+            });
+          });
+        }
       } catch (e) {
         logger.warn(`[Upstream] sampling failed: ${e.message}`);
       }
@@ -174,6 +202,44 @@ class UpstreamConnector {
     this.socket.on('player-props-update', (data) => {
       logger.debug(`Received player-props-update from upstream`);
 
+      // DEBUG: Log full payload structure for player props
+      if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+        console.log('\n========== PLAYER PROPS PAYLOAD DEBUG ==========');
+        console.log('Top-level keys:', Object.keys(data || {}));
+        console.log('Has sports?', !!data?.sports);
+        console.log('Has timestamp?', !!data?.timestamp);
+
+        const sportsObj = data?.sports || {};
+        console.log('Sports keys:', Object.keys(sportsObj));
+
+        // Log sample from each sport
+        Object.entries(sportsObj).forEach(([sportKey, games]) => {
+          if (Array.isArray(games) && games.length > 0) {
+            console.log(`\n--- ${sportKey.toUpperCase()} (${games.length} games) ---`);
+            const sampleGame = games[0];
+            console.log('Sample game keys:', Object.keys(sampleGame || {}));
+            console.log('Sample game:', JSON.stringify(sampleGame, null, 2).slice(0, 2000));
+
+            // If there are books, show the structure
+            if (Array.isArray(sampleGame?.books) && sampleGame.books.length > 0) {
+              console.log('\nBooks array length:', sampleGame.books.length);
+              const sampleBook = sampleGame.books[0];
+              console.log('Sample book keys:', Object.keys(sampleBook || {}));
+              console.log('Sample book:', JSON.stringify(sampleBook, null, 2).slice(0, 1500));
+
+              // If there are props, show the structure
+              if (Array.isArray(sampleBook?.props) && sampleBook.props.length > 0) {
+                console.log('\nProps array length:', sampleBook.props.length);
+                const sampleProp = sampleBook.props[0];
+                console.log('Sample prop keys:', Object.keys(sampleProp || {}));
+                console.log('Sample prop:', JSON.stringify(sampleProp, null, 2));
+              }
+            }
+          }
+        });
+        console.log('=================================================\n');
+      }
+
       try {
         const sportsObj = data.sports || {};
         const propsCounts = {};
@@ -197,7 +263,71 @@ class UpstreamConnector {
 
     // Handle props subscription confirmation
     this.socket.on('props-subscribed', (subscription) => {
-      logger.info(`Props subscription confirmed: ${JSON.stringify(subscription)}`);
+      logger.info(`Pinnacle props subscription confirmed: ${JSON.stringify(subscription)}`);
+    });
+
+    // Handle Bet365 player props update from upstream
+    this.socket.on('bet365-props-update', (data) => {
+      logger.debug(`Received bet365-props-update from upstream`);
+
+      // DEBUG: Always log Bet365 props receipt
+      console.log('\n========== BET365 PROPS RECEIVED FROM UPSTREAM ==========');
+      console.log('Timestamp:', new Date().toISOString());
+      console.log('Data type:', typeof data);
+      console.log('Has sports?', !!data?.sports);
+      console.log('Top-level keys:', Object.keys(data || {}));
+
+      try {
+        const sportsObj = data.sports || {};
+        const propsCounts = {};
+        let totalGames = 0;
+        let totalProps = 0;
+
+        Object.entries(sportsObj).forEach(([sportKey, games]) => {
+          if (Array.isArray(games)) {
+            propsCounts[sportKey] = games.length;
+            totalGames += games.length;
+            // Count total props for each game
+            games.forEach(game => {
+              if (Array.isArray(game.props)) {
+                totalProps += game.props.length;
+              }
+            });
+          }
+        });
+
+        console.log('Sports breakdown:', propsCounts);
+        console.log(`Total: ${totalProps} props from ${totalGames} games`);
+
+        // Log sample game structure
+        const firstSportWithGames = Object.entries(sportsObj).find(([_, games]) => Array.isArray(games) && games.length > 0);
+        if (firstSportWithGames) {
+          const [sport, games] = firstSportWithGames;
+          const sampleGame = games[0];
+          console.log(`\nSample game from ${sport}:`);
+          console.log('  gameId:', sampleGame?.gameId);
+          console.log('  homeTeam:', sampleGame?.homeTeam);
+          console.log('  awayTeam:', sampleGame?.awayTeam);
+          console.log('  props count:', sampleGame?.props?.length || 0);
+          if (sampleGame?.props?.length > 0) {
+            console.log('  Sample prop:', JSON.stringify(sampleGame.props[0], null, 2).slice(0, 500));
+          }
+        }
+        console.log('=========================================================\n');
+
+        logger.debug(`[Upstream] bet365-props-update: ${totalProps} props from ${totalGames} games`, propsCounts);
+      } catch (e) {
+        console.log('ERROR processing bet365 props:', e.message);
+        logger.warn(`[Upstream] bet365 props debug failed: ${e.message}`);
+      }
+
+      // Pass through directly (no transformation needed for Bet365 props)
+      this.onBet365PropsUpdate(data);
+    });
+
+    // Handle Bet365 props subscription confirmation
+    this.socket.on('bet365-props-subscribed', (subscription) => {
+      logger.info(`Bet365 props subscription confirmed: ${JSON.stringify(subscription)}`);
     });
 
     // Handle additional event names if configured

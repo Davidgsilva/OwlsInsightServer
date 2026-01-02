@@ -317,12 +317,18 @@ app.get('/api/v1/:sport/props', async (req, res) => {
   const { sport } = req.params;
   const { game_id, player, category } = req.query;
 
+  console.log(`[DEBUG Props] GET /api/v1/${sport}/props - query:`, { game_id, player, category });
+
   if (!VALID_SPORTS.includes(sport)) {
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
   // First try to return cached data from WebSocket
   if (latestPropsData) {
+    console.log(`[DEBUG Props] Using cached Pinnacle props data for ${sport}`);
+    console.log(`[DEBUG Props] Cache has sports:`, Object.keys(latestPropsData.sports || {}));
+    const sportGames = latestPropsData.sports?.[sport] || [];
+    console.log(`[DEBUG Props] ${sport} has ${sportGames.length} games in cache`);
     const sportData = latestPropsData.sports?.[sport] || [];
     let filteredData = sportData;
 
@@ -363,6 +369,8 @@ app.get('/api/v1/:sport/props', async (req, res) => {
       });
     });
 
+    console.log(`[DEBUG Props] Returning ${propsCount} Pinnacle props for ${sport} from ${filteredData.length} games (cached)`);
+
     return res.json({
       success: true,
       data: filteredData,
@@ -374,6 +382,8 @@ app.get('/api/v1/:sport/props', async (req, res) => {
         cached: true,
       }
     });
+  } else {
+    console.log(`[DEBUG Props] No cached Pinnacle props data available for ${sport}`);
   }
 
   // Fall back to upstream API
@@ -395,10 +405,12 @@ app.get('/api/v1/:sport/props', async (req, res) => {
     });
 
     if (!resp.ok) {
+      console.log(`[DEBUG Props] Upstream failed for ${sport}: ${resp.status}`);
       return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
     }
 
     const data = await resp.json();
+    console.log(`[DEBUG Props] Upstream response for ${sport}: ${data.data?.length || 0} games, ${data.meta?.propsReturned || 0} props`);
     return res.json(data);
   } catch (err) {
     logger.error(`Props proxy error (${sport}): ${err.message}`);
@@ -410,17 +422,75 @@ app.get('/api/v1/:sport/props', async (req, res) => {
 // Bet365 Player Props proxy endpoints
 // -----------------------------------------------------------------------------
 
-// Bet365 Props proxy - fetches from upstream Bet365 props endpoint
+// Bet365 Props proxy - uses WebSocket cache first, falls back to upstream
 app.get('/api/v1/:sport/props/bet365', async (req, res) => {
   const { sport } = req.params;
   const { game_id, player, category } = req.query;
+
+  console.log(`[DEBUG Bet365 Props] GET /api/v1/${sport}/props/bet365 - query:`, { game_id, player, category });
 
   if (!VALID_SPORTS.includes(sport)) {
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
+  // First try to return cached data from WebSocket
+  if (latestBet365PropsData) {
+    console.log(`[DEBUG Bet365 Props] Using cached Bet365 props data for ${sport}`);
+    const sportGames = latestBet365PropsData.sports?.[sport] || [];
+    console.log(`[DEBUG Bet365 Props] ${sport} has ${sportGames.length} games in cache`);
+    let filteredData = [...sportGames];
+
+    // Apply filters if provided
+    if (game_id) {
+      filteredData = filteredData.filter(g => g.gameId === game_id || g.game_id === game_id);
+    }
+    if (player) {
+      const playerLower = player.toLowerCase();
+      filteredData = filteredData.map(g => ({
+        ...g,
+        props: (g.props || []).filter(p =>
+          (p.playerName || p.player_name || '').toLowerCase().includes(playerLower)
+        )
+      })).filter(g => g.props.length > 0);
+    }
+    if (category) {
+      const catLower = category.toLowerCase();
+      filteredData = filteredData.map(g => ({
+        ...g,
+        props: (g.props || []).filter(p =>
+          (p.category || '').toLowerCase() === catLower
+        )
+      })).filter(g => g.props.length > 0);
+    }
+
+    // Count props
+    let propsCount = 0;
+    filteredData.forEach(g => {
+      propsCount += (g.props || []).length;
+    });
+
+    console.log(`[DEBUG Bet365 Props] Returning ${propsCount} Bet365 props for ${sport} from ${filteredData.length} games (cached)`);
+
+    return res.json({
+      success: true,
+      data: filteredData,
+      meta: {
+        sport,
+        book: 'bet365',
+        timestamp: latestBet365PropsData.timestamp,
+        propsReturned: propsCount,
+        gamesReturned: filteredData.length,
+        cached: true,
+      }
+    });
+  } else {
+    console.log(`[DEBUG Bet365 Props] No cached Bet365 props data available for ${sport}`);
+  }
+
+  // Fall back to upstream API
   try {
     const apiBase = getApiBaseUrl();
+    console.log(`[DEBUG Bet365 Props] Fetching from upstream: ${apiBase}/api/v1/${sport}/props/bet365`);
     const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'bet365 props proxy not configured' });
@@ -443,6 +513,7 @@ app.get('/api/v1/:sport/props/bet365', async (req, res) => {
     }
 
     const data = await resp.json();
+    console.log(`[DEBUG Bet365 Props] Response for ${sport}: ${data.data?.length || 0} games, ${data.meta?.propsReturned || 0} props`);
     return res.json(data);
   } catch (err) {
     logger.error(`Bet365 props proxy error (${sport}): ${err.message}`);
@@ -634,6 +705,7 @@ app.get('/health', (req, res) => {
     hasOddsData: !!latestOddsData,
     hasScoresData: !!latestScoresData,
     hasPropsData: !!latestPropsData,
+    hasBet365PropsData: !!latestBet365PropsData,
   });
 });
 
@@ -669,6 +741,9 @@ let latestScoresData = null;
 
 // Store latest player props data for new connections
 let latestPropsData = null;
+
+// Store latest Bet365 player props data for new connections
+let latestBet365PropsData = null;
 
 // Initialize upstream connector
 let upstreamConnector = null;
@@ -831,23 +906,22 @@ function fuzzyMatchScore(oddsHome, oddsAway, allScores) {
     }
   }
 
-  // Single-team unique match fallback:
-  // If one team matches exactly and there's only ONE score with that team, it's safe to match
-  // This handles cases where odds provider has wrong opponent name (e.g., "California" instead of "UC Irvine")
-  const awayMatches = allScores.filter(s => s.awayKey.startsWith(oa) || oa.startsWith(s.awayKey));
-  if (awayMatches.length === 1) {
-    if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
-      console.log(`[DEBUG_OWLS_INSIGHT] Single-team match (away): ${oddsAway} → ${awayMatches[0].away} @ ${awayMatches[0].home}`);
-    }
-    return awayMatches[0];
-  }
+  // Single-team fallback DISABLED - too many false positives
+  // The issue: "E Kentucky @ NC State" was matching "E Kentucky @ Queens" because
+  // E Kentucky only appeared once in live scores, but the opponents are completely different.
+  // The fuzzy prefix matching above handles legitimate cases like "Delaware" vs "Delaware Blue Hens"
+  // where BOTH teams have some overlap.
 
-  const homeMatches = allScores.filter(s => s.homeKey.startsWith(oh) || oh.startsWith(s.homeKey));
-  if (homeMatches.length === 1) {
-    if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
-      console.log(`[DEBUG_OWLS_INSIGHT] Single-team match (home): ${oddsHome} → ${homeMatches[0].away} @ ${homeMatches[0].home}`);
+  if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+    // Log for debugging - which games couldn't be matched
+    const awayMatches = allScores.filter(s => s.awayKey.startsWith(oa) || oa.startsWith(s.awayKey));
+    const homeMatches = allScores.filter(s => s.homeKey.startsWith(oh) || oh.startsWith(s.homeKey));
+    if (awayMatches.length > 0 || homeMatches.length > 0) {
+      console.log(`[DEBUG_OWLS_INSIGHT] Partial match rejected (requires both teams): ${oddsAway} @ ${oddsHome}`, {
+        awayMatches: awayMatches.map(m => `${m.away} @ ${m.home}`),
+        homeMatches: homeMatches.map(m => `${m.away} @ ${m.home}`),
+      });
     }
-    return homeMatches[0];
   }
 
   return null;
@@ -1108,6 +1182,58 @@ function broadcastPropsUpdate(data) {
   logger.info(`Broadcasted props update to ${io.engine.clientsCount} clients`);
 }
 
+// Broadcast Bet365 player props update to all connected clients
+function broadcastBet365PropsUpdate(data) {
+  // DEBUG: Log entry into broadcast function
+  console.log('\n========== BROADCASTING BET365 PROPS DOWNSTREAM ==========');
+  console.log('Timestamp:', new Date().toISOString());
+  console.log('Connected clients:', io.engine.clientsCount);
+
+  try {
+    const sportsObj = data.sports || {};
+    const propsCounts = {};
+    let totalGames = 0;
+    let totalProps = 0;
+
+    Object.entries(sportsObj).forEach(([sportKey, games]) => {
+      if (Array.isArray(games)) {
+        propsCounts[sportKey] = games.length;
+        totalGames += games.length;
+        // Count total props for each game (Bet365 has flat props array)
+        games.forEach(game => {
+          if (Array.isArray(game.props)) {
+            totalProps += game.props.length;
+          }
+        });
+      }
+    });
+
+    console.log('Sports breakdown:', propsCounts);
+    console.log(`Total: ${totalProps} props from ${totalGames} games`);
+
+    logger.debug(`[Upstream] bet365-props-update received. ${totalProps} props from ${totalGames} games`, propsCounts);
+  } catch (e) {
+    console.log('ERROR in broadcast:', e.message);
+    logger.warn(`[Upstream] bet365 props debug log failed: ${e.message}`);
+  }
+
+  // Cache for new connections
+  latestBet365PropsData = data;
+  console.log('Cached latestBet365PropsData:', !!latestBet365PropsData);
+
+  const payload = {
+    sports: data.sports || {},
+    timestamp: data.timestamp || new Date().toISOString(),
+  };
+
+  console.log('Emitting bet365-props-update to', io.engine.clientsCount, 'clients');
+  console.log('Payload sports keys:', Object.keys(payload.sports || {}));
+  console.log('============================================================\n');
+
+  io.emit('bet365-props-update', payload);
+  logger.info(`Broadcasted Bet365 props update to ${io.engine.clientsCount} clients`);
+}
+
 // -----------------------------------------------------------------------------
 // Optional debug probe: verify history endpoint returns rows for a sample game
 // -----------------------------------------------------------------------------
@@ -1305,6 +1431,18 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Handle manual Bet365 props refresh request from client
+  socket.on('request-bet365-props', () => {
+    logger.debug(`Client ${socket.id} requested Bet365 props refresh`);
+    if (latestBet365PropsData) {
+      logger.debug(`[Downstream] re-sending cached Bet365 props to ${socket.id}`);
+      socket.emit('bet365-props-update', {
+        sports: latestBet365PropsData.sports || {},
+        timestamp: latestBet365PropsData.timestamp || new Date().toISOString(),
+      });
+    }
+  });
+
   // Handle client disconnect
   socket.on('disconnect', (reason) => {
     clearSocketWatchers(socket.id);
@@ -1328,6 +1466,7 @@ server.listen(PORT, () => {
     onOddsUpdate: broadcastOddsUpdate,
     onScoresUpdate: broadcastScoresUpdate,
     onPropsUpdate: broadcastPropsUpdate,
+    onBet365PropsUpdate: broadcastBet365PropsUpdate,
     onConnect: () => logger.info('Upstream connected'),
     onDisconnect: (reason) => logger.warn(`Upstream disconnected: ${reason}`),
     onError: (error) => logger.error(`Upstream error: ${error.message}`),
