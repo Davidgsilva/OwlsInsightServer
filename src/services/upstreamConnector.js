@@ -23,6 +23,10 @@ class UpstreamConnector {
     this.onScoresUpdate = options.onScoresUpdate || (() => {});
     this.onPropsUpdate = options.onPropsUpdate || (() => {});
     this.onBet365PropsUpdate = options.onBet365PropsUpdate || (() => {});
+    this.onFanDuelPropsUpdate = options.onFanDuelPropsUpdate || (() => {});
+    this.onDraftKingsPropsUpdate = options.onDraftKingsPropsUpdate || (() => {});
+    this.onBetMGMPropsUpdate = options.onBetMGMPropsUpdate || (() => {});
+    this.onCaesarsPropsUpdate = options.onCaesarsPropsUpdate || (() => {});
     this.onConnect = options.onConnect || (() => {});
     this.onDisconnect = options.onDisconnect || (() => {});
     this.onError = options.onError || (() => {});
@@ -101,6 +105,30 @@ class UpstreamConnector {
         sports: ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'],
       });
       logger.info('Sent Bet365 props subscription request for all sports');
+
+      // Subscribe to FanDuel player props
+      this.socket.emit('subscribe-fanduel-props', {
+        sports: ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'],
+      });
+      logger.info('Sent FanDuel props subscription request for all sports');
+
+      // Subscribe to DraftKings player props
+      this.socket.emit('subscribe-draftkings-props', {
+        sports: ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'],
+      });
+      logger.info('Sent DraftKings props subscription request for all sports');
+
+      // Subscribe to BetMGM player props
+      this.socket.emit('subscribe-betmgm-props', {
+        sports: ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'],
+      });
+      logger.info('Sent BetMGM props subscription request for all sports');
+
+      // Subscribe to Caesars player props
+      this.socket.emit('subscribe-caesars-props', {
+        sports: ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'],
+      });
+      logger.info('Sent Caesars props subscription request for all sports');
     });
 
     // Handle odds update from upstream
@@ -269,65 +297,56 @@ class UpstreamConnector {
     // Handle Bet365 player props update from upstream
     this.socket.on('bet365-props-update', (data) => {
       logger.debug(`Received bet365-props-update from upstream`);
-
-      // DEBUG: Always log Bet365 props receipt
-      console.log('\n========== BET365 PROPS RECEIVED FROM UPSTREAM ==========');
-      console.log('Timestamp:', new Date().toISOString());
-      console.log('Data type:', typeof data);
-      console.log('Has sports?', !!data?.sports);
-      console.log('Top-level keys:', Object.keys(data || {}));
-
-      try {
-        const sportsObj = data.sports || {};
-        const propsCounts = {};
-        let totalGames = 0;
-        let totalProps = 0;
-
-        Object.entries(sportsObj).forEach(([sportKey, games]) => {
-          if (Array.isArray(games)) {
-            propsCounts[sportKey] = games.length;
-            totalGames += games.length;
-            // Count total props for each game
-            games.forEach(game => {
-              if (Array.isArray(game.props)) {
-                totalProps += game.props.length;
-              }
-            });
-          }
-        });
-
-        console.log('Sports breakdown:', propsCounts);
-        console.log(`Total: ${totalProps} props from ${totalGames} games`);
-
-        // Log sample game structure
-        const firstSportWithGames = Object.entries(sportsObj).find(([_, games]) => Array.isArray(games) && games.length > 0);
-        if (firstSportWithGames) {
-          const [sport, games] = firstSportWithGames;
-          const sampleGame = games[0];
-          console.log(`\nSample game from ${sport}:`);
-          console.log('  gameId:', sampleGame?.gameId);
-          console.log('  homeTeam:', sampleGame?.homeTeam);
-          console.log('  awayTeam:', sampleGame?.awayTeam);
-          console.log('  props count:', sampleGame?.props?.length || 0);
-          if (sampleGame?.props?.length > 0) {
-            console.log('  Sample prop:', JSON.stringify(sampleGame.props[0], null, 2).slice(0, 500));
-          }
-        }
-        console.log('=========================================================\n');
-
-        logger.debug(`[Upstream] bet365-props-update: ${totalProps} props from ${totalGames} games`, propsCounts);
-      } catch (e) {
-        console.log('ERROR processing bet365 props:', e.message);
-        logger.warn(`[Upstream] bet365 props debug failed: ${e.message}`);
-      }
-
-      // Pass through directly (no transformation needed for Bet365 props)
       this.onBet365PropsUpdate(data);
     });
 
     // Handle Bet365 props subscription confirmation
     this.socket.on('bet365-props-subscribed', (subscription) => {
       logger.info(`Bet365 props subscription confirmed: ${JSON.stringify(subscription)}`);
+    });
+
+    // Handle FanDuel player props update from upstream
+    this.socket.on('fanduel-props-update', (data) => {
+      logger.debug(`Received fanduel-props-update from upstream`);
+      this.onFanDuelPropsUpdate(data);
+    });
+
+    // Handle FanDuel props subscription confirmation
+    this.socket.on('fanduel-props-subscribed', (subscription) => {
+      logger.info(`FanDuel props subscription confirmed: ${JSON.stringify(subscription)}`);
+    });
+
+    // Handle DraftKings player props update from upstream
+    this.socket.on('draftkings-props-update', (data) => {
+      logger.debug(`Received draftkings-props-update from upstream`);
+      this.onDraftKingsPropsUpdate(data);
+    });
+
+    // Handle DraftKings props subscription confirmation
+    this.socket.on('draftkings-props-subscribed', (subscription) => {
+      logger.info(`DraftKings props subscription confirmed: ${JSON.stringify(subscription)}`);
+    });
+
+    // Handle BetMGM player props update from upstream
+    this.socket.on('betmgm-props-update', (data) => {
+      logger.debug(`Received betmgm-props-update from upstream`);
+      this.onBetMGMPropsUpdate(data);
+    });
+
+    // Handle BetMGM props subscription confirmation
+    this.socket.on('betmgm-props-subscribed', (subscription) => {
+      logger.info(`BetMGM props subscription confirmed: ${JSON.stringify(subscription)}`);
+    });
+
+    // Handle Caesars player props update from upstream
+    this.socket.on('caesars-props-update', (data) => {
+      logger.debug(`Received caesars-props-update from upstream`);
+      this.onCaesarsPropsUpdate(data);
+    });
+
+    // Handle Caesars props subscription confirmation
+    this.socket.on('caesars-props-subscribed', (subscription) => {
+      logger.info(`Caesars props subscription confirmed: ${JSON.stringify(subscription)}`);
     });
 
     // Handle additional event names if configured

@@ -7,7 +7,7 @@ const logger = require('./utils/logger');
 const UpstreamConnector = require('./services/upstreamConnector');
 
 // Configuration
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3002;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 
 // Initialize Express
@@ -309,6 +309,319 @@ app.get('/api/v1/:sport/scores/live', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
+// Odds REST endpoints (return cached WebSocket data)
+// -----------------------------------------------------------------------------
+
+// Helper to filter bookmaker markets
+function filterBookmakerMarkets(bookmakers, marketKey) {
+  if (!Array.isArray(bookmakers)) return [];
+  return bookmakers.map(b => ({
+    ...b,
+    markets: (b.markets || []).filter(m => m.key === marketKey)
+  })).filter(b => b.markets.length > 0);
+}
+
+// All odds for a sport (from WebSocket cache)
+app.get('/api/v1/:sport/odds', async (req, res) => {
+  const { sport } = req.params;
+  const { eventId, books } = req.query;
+
+  if (!VALID_SPORTS.includes(sport)) {
+    return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
+  }
+
+  // Return cached data from WebSocket
+  if (latestOddsData) {
+    let sportData = latestOddsData[sport] || [];
+
+    // Filter by eventId if provided
+    if (eventId) {
+      sportData = sportData.filter(g =>
+        g.eventId === eventId || g.id === eventId || g.event_id === eventId
+      );
+    }
+
+    // Filter by books if provided
+    if (books) {
+      const bookList = books.split(',').map(b => b.trim().toLowerCase());
+      sportData = sportData.map(g => ({
+        ...g,
+        bookmakers: (g.bookmakers || []).filter(b =>
+          bookList.includes((b.key || '').toLowerCase())
+        )
+      }));
+    }
+
+    return res.json({
+      success: true,
+      data: sportData,
+      meta: {
+        sport,
+        count: sportData.length,
+        timestamp: new Date().toISOString(),
+        cached: true,
+      }
+    });
+  }
+
+  // Fall back to upstream API
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'odds proxy not configured' });
+    }
+
+    const params = new URLSearchParams();
+    if (eventId) params.append('eventId', eventId);
+    if (books) params.append('books', books);
+
+    const url = `${apiBase}/api/v1/${sport}/odds${params.toString() ? '?' + params.toString() : ''}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`Odds proxy error (${sport}): ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch odds' });
+  }
+});
+
+// Moneyline only (h2h market)
+app.get('/api/v1/:sport/moneyline', async (req, res) => {
+  const { sport } = req.params;
+  const { eventId, books } = req.query;
+
+  if (!VALID_SPORTS.includes(sport)) {
+    return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
+  }
+
+  if (latestOddsData) {
+    let sportData = latestOddsData[sport] || [];
+
+    if (eventId) {
+      sportData = sportData.filter(g =>
+        g.eventId === eventId || g.id === eventId || g.event_id === eventId
+      );
+    }
+
+    // Filter to only h2h markets
+    sportData = sportData.map(g => ({
+      ...g,
+      bookmakers: filterBookmakerMarkets(g.bookmakers, 'h2h')
+    }));
+
+    if (books) {
+      const bookList = books.split(',').map(b => b.trim().toLowerCase());
+      sportData = sportData.map(g => ({
+        ...g,
+        bookmakers: (g.bookmakers || []).filter(b =>
+          bookList.includes((b.key || '').toLowerCase())
+        )
+      }));
+    }
+
+    return res.json({
+      success: true,
+      data: sportData,
+      meta: {
+        sport,
+        market: 'h2h',
+        count: sportData.length,
+        timestamp: new Date().toISOString(),
+        cached: true,
+      }
+    });
+  }
+
+  // Fall back to upstream
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'moneyline proxy not configured' });
+    }
+
+    const params = new URLSearchParams();
+    if (eventId) params.append('eventId', eventId);
+    if (books) params.append('books', books);
+
+    const url = `${apiBase}/api/v1/${sport}/moneyline${params.toString() ? '?' + params.toString() : ''}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`Moneyline proxy error (${sport}): ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch moneyline' });
+  }
+});
+
+// Spreads only
+app.get('/api/v1/:sport/spreads', async (req, res) => {
+  const { sport } = req.params;
+  const { eventId, books } = req.query;
+
+  if (!VALID_SPORTS.includes(sport)) {
+    return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
+  }
+
+  if (latestOddsData) {
+    let sportData = latestOddsData[sport] || [];
+
+    if (eventId) {
+      sportData = sportData.filter(g =>
+        g.eventId === eventId || g.id === eventId || g.event_id === eventId
+      );
+    }
+
+    // Filter to only spreads markets
+    sportData = sportData.map(g => ({
+      ...g,
+      bookmakers: filterBookmakerMarkets(g.bookmakers, 'spreads')
+    }));
+
+    if (books) {
+      const bookList = books.split(',').map(b => b.trim().toLowerCase());
+      sportData = sportData.map(g => ({
+        ...g,
+        bookmakers: (g.bookmakers || []).filter(b =>
+          bookList.includes((b.key || '').toLowerCase())
+        )
+      }));
+    }
+
+    return res.json({
+      success: true,
+      data: sportData,
+      meta: {
+        sport,
+        market: 'spreads',
+        count: sportData.length,
+        timestamp: new Date().toISOString(),
+        cached: true,
+      }
+    });
+  }
+
+  // Fall back to upstream
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'spreads proxy not configured' });
+    }
+
+    const params = new URLSearchParams();
+    if (eventId) params.append('eventId', eventId);
+    if (books) params.append('books', books);
+
+    const url = `${apiBase}/api/v1/${sport}/spreads${params.toString() ? '?' + params.toString() : ''}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`Spreads proxy error (${sport}): ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch spreads' });
+  }
+});
+
+// Totals only
+app.get('/api/v1/:sport/totals', async (req, res) => {
+  const { sport } = req.params;
+  const { eventId, books } = req.query;
+
+  if (!VALID_SPORTS.includes(sport)) {
+    return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
+  }
+
+  if (latestOddsData) {
+    let sportData = latestOddsData[sport] || [];
+
+    if (eventId) {
+      sportData = sportData.filter(g =>
+        g.eventId === eventId || g.id === eventId || g.event_id === eventId
+      );
+    }
+
+    // Filter to only totals markets
+    sportData = sportData.map(g => ({
+      ...g,
+      bookmakers: filterBookmakerMarkets(g.bookmakers, 'totals')
+    }));
+
+    if (books) {
+      const bookList = books.split(',').map(b => b.trim().toLowerCase());
+      sportData = sportData.map(g => ({
+        ...g,
+        bookmakers: (g.bookmakers || []).filter(b =>
+          bookList.includes((b.key || '').toLowerCase())
+        )
+      }));
+    }
+
+    return res.json({
+      success: true,
+      data: sportData,
+      meta: {
+        sport,
+        market: 'totals',
+        count: sportData.length,
+        timestamp: new Date().toISOString(),
+        cached: true,
+      }
+    });
+  }
+
+  // Fall back to upstream
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'totals proxy not configured' });
+    }
+
+    const params = new URLSearchParams();
+    if (eventId) params.append('eventId', eventId);
+    if (books) params.append('books', books);
+
+    const url = `${apiBase}/api/v1/${sport}/totals${params.toString() ? '?' + params.toString() : ''}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`Totals proxy error (${sport}): ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch totals' });
+  }
+});
+
+// -----------------------------------------------------------------------------
 // Player Props proxy endpoints
 // -----------------------------------------------------------------------------
 
@@ -427,17 +740,13 @@ app.get('/api/v1/:sport/props/bet365', async (req, res) => {
   const { sport } = req.params;
   const { game_id, player, category } = req.query;
 
-  console.log(`[DEBUG Bet365 Props] GET /api/v1/${sport}/props/bet365 - query:`, { game_id, player, category });
-
   if (!VALID_SPORTS.includes(sport)) {
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
   // First try to return cached data from WebSocket
   if (latestBet365PropsData) {
-    console.log(`[DEBUG Bet365 Props] Using cached Bet365 props data for ${sport}`);
     const sportGames = latestBet365PropsData.sports?.[sport] || [];
-    console.log(`[DEBUG Bet365 Props] ${sport} has ${sportGames.length} games in cache`);
     let filteredData = [...sportGames];
 
     // Apply filters if provided
@@ -469,8 +778,6 @@ app.get('/api/v1/:sport/props/bet365', async (req, res) => {
       propsCount += (g.props || []).length;
     });
 
-    console.log(`[DEBUG Bet365 Props] Returning ${propsCount} Bet365 props for ${sport} from ${filteredData.length} games (cached)`);
-
     return res.json({
       success: true,
       data: filteredData,
@@ -483,14 +790,11 @@ app.get('/api/v1/:sport/props/bet365', async (req, res) => {
         cached: true,
       }
     });
-  } else {
-    console.log(`[DEBUG Bet365 Props] No cached Bet365 props data available for ${sport}`);
   }
 
   // Fall back to upstream API
   try {
     const apiBase = getApiBaseUrl();
-    console.log(`[DEBUG Bet365 Props] Fetching from upstream: ${apiBase}/api/v1/${sport}/props/bet365`);
     const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'bet365 props proxy not configured' });
@@ -513,7 +817,6 @@ app.get('/api/v1/:sport/props/bet365', async (req, res) => {
     }
 
     const data = await resp.json();
-    console.log(`[DEBUG Bet365 Props] Response for ${sport}: ${data.data?.length || 0} games, ${data.meta?.propsReturned || 0} props`);
     return res.json(data);
   } catch (err) {
     logger.error(`Bet365 props proxy error (${sport}): ${err.message}`);
@@ -546,6 +849,262 @@ app.get('/api/v1/props/bet365/stats', async (req, res) => {
   } catch (err) {
     logger.error(`Bet365 props stats proxy error: ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch bet365 props stats' });
+  }
+});
+
+// FanDuel Props stats endpoint
+app.get('/api/v1/props/fanduel/stats', async (req, res) => {
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'fanduel stats proxy not configured' });
+    }
+
+    const url = `${apiBase}/api/v1/props/fanduel/stats`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      const errorBody = await resp.text().catch(() => '');
+      logger.error(`FanDuel props stats upstream failed: ${resp.status} - ${errorBody.slice(0, 200)}`);
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`FanDuel props stats proxy error: ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch fanduel props stats' });
+  }
+});
+
+// FanDuel Props proxy - uses WebSocket cache first, falls back to upstream
+app.get('/api/v1/:sport/props/fanduel', async (req, res) => {
+  const { sport } = req.params;
+  const { game_id, player, category } = req.query;
+
+  if (!VALID_SPORTS.includes(sport)) {
+    return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
+  }
+
+  // First try to return cached data from WebSocket
+  if (latestFanDuelPropsData) {
+    const sportGames = latestFanDuelPropsData.sports?.[sport] || [];
+    let filteredData = [...sportGames];
+
+    // Apply filters if provided
+    if (game_id) {
+      filteredData = filteredData.filter(g => g.gameId === game_id || g.game_id === game_id);
+    }
+    if (player) {
+      const playerLower = player.toLowerCase();
+      filteredData = filteredData.map(g => ({
+        ...g,
+        props: (g.props || []).filter(p =>
+          (p.playerName || p.player_name || '').toLowerCase().includes(playerLower)
+        )
+      })).filter(g => g.props.length > 0);
+    }
+    if (category) {
+      const catLower = category.toLowerCase();
+      filteredData = filteredData.map(g => ({
+        ...g,
+        props: (g.props || []).filter(p =>
+          (p.category || '').toLowerCase() === catLower
+        )
+      })).filter(g => g.props.length > 0);
+    }
+
+    // Count props
+    let propsCount = 0;
+    filteredData.forEach(g => {
+      propsCount += (g.props || []).length;
+    });
+
+    return res.json({
+      success: true,
+      data: filteredData,
+      meta: {
+        sport,
+        book: 'fanduel',
+        timestamp: latestFanDuelPropsData.timestamp,
+        propsReturned: propsCount,
+        gamesReturned: filteredData.length,
+        cached: true,
+      }
+    });
+  }
+
+  // Fall back to upstream API
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'fanduel props proxy not configured' });
+    }
+
+    const params = new URLSearchParams();
+    if (game_id) params.append('game_id', game_id);
+    if (player) params.append('player', player);
+    if (category) params.append('category', category);
+
+    const url = `${apiBase}/api/v1/${sport}/props/fanduel${params.toString() ? '?' + params.toString() : ''}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      const errorBody = await resp.text().catch(() => '');
+      logger.error(`FanDuel props upstream failed: ${resp.status} - ${errorBody.slice(0, 200)}`);
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`FanDuel props proxy error (${sport}): ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch fanduel props' });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// DraftKings Player Props proxy endpoints
+// -----------------------------------------------------------------------------
+
+// DraftKings Props proxy - uses WebSocket cache first, falls back to upstream
+app.get('/api/v1/:sport/props/draftkings', async (req, res) => {
+  const { sport } = req.params;
+  const { game_id, player, category } = req.query;
+
+  if (!VALID_SPORTS.includes(sport)) {
+    return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
+  }
+
+  // First try to return cached data from WebSocket
+  if (latestDraftKingsPropsData) {
+    const sportGames = latestDraftKingsPropsData.sports?.[sport] || [];
+    let filteredData = [...sportGames];
+
+    // Apply filters if provided
+    if (game_id) {
+      filteredData = filteredData.filter(g => g.gameId === game_id || g.game_id === game_id);
+    }
+    if (player) {
+      const playerLower = player.toLowerCase();
+      filteredData = filteredData.map(g => ({
+        ...g,
+        props: (g.props || []).filter(p =>
+          (p.playerName || p.player_name || '').toLowerCase().includes(playerLower)
+        )
+      })).filter(g => g.props.length > 0);
+    }
+    if (category) {
+      const catLower = category.toLowerCase();
+      filteredData = filteredData.map(g => ({
+        ...g,
+        props: (g.props || []).filter(p =>
+          (p.category || '').toLowerCase() === catLower
+        )
+      })).filter(g => g.props.length > 0);
+    }
+
+    // Count props
+    let propsCount = 0;
+    filteredData.forEach(g => {
+      propsCount += (g.props || []).length;
+    });
+
+    return res.json({
+      success: true,
+      data: filteredData,
+      meta: {
+        sport,
+        book: 'draftkings',
+        timestamp: latestDraftKingsPropsData.timestamp,
+        propsReturned: propsCount,
+        gamesReturned: filteredData.length,
+        cached: true,
+      }
+    });
+  }
+
+  // Fall back to upstream API
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'draftkings props proxy not configured' });
+    }
+
+    const params = new URLSearchParams();
+    if (game_id) params.append('game_id', game_id);
+    if (player) params.append('player', player);
+    if (category) params.append('category', category);
+
+    const url = `${apiBase}/api/v1/${sport}/props/draftkings${params.toString() ? '?' + params.toString() : ''}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      const errorBody = await resp.text().catch(() => '');
+      logger.error(`DraftKings props upstream failed: ${resp.status} - ${errorBody.slice(0, 200)}`);
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`DraftKings props proxy error (${sport}): ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch draftkings props' });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Props History proxy endpoint
+// -----------------------------------------------------------------------------
+
+// Props history - fetches historical player props from upstream
+app.get('/api/v1/:sport/props/history', async (req, res) => {
+  const { sport } = req.params;
+  const { player, category, prop_type, hours, book } = req.query;
+
+  if (!VALID_SPORTS.includes(sport)) {
+    return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
+  }
+
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'props history proxy not configured' });
+    }
+
+    const params = new URLSearchParams();
+    if (player) params.append('player', player);
+    if (category) params.append('category', category);
+    if (prop_type) params.append('prop_type', prop_type);
+    if (hours) params.append('hours', hours);
+    if (book) params.append('book', book);
+
+    const url = `${apiBase}/api/v1/${sport}/props/history${params.toString() ? '?' + params.toString() : ''}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      const errorBody = await resp.text().catch(() => '');
+      logger.error(`Props history upstream failed: ${resp.status} - ${errorBody.slice(0, 200)}`);
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`Props history proxy error (${sport}): ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch props history' });
   }
 });
 
@@ -642,6 +1201,138 @@ app.get('/api/odds/ev/history', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
+// Analytics proxy endpoint
+// -----------------------------------------------------------------------------
+
+// Analytics - fetches odds analytics from upstream
+app.get('/api/odds/analytics', async (req, res) => {
+  const { eventId, book, market, hours, granularity } = req.query;
+
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'analytics proxy not configured' });
+    }
+
+    const params = new URLSearchParams();
+    if (eventId) params.append('eventId', eventId);
+    if (book) params.append('book', book);
+    if (market) params.append('market', market);
+    if (hours) params.append('hours', hours);
+    if (granularity) params.append('granularity', granularity);
+
+    const url = `${apiBase}/api/odds/analytics${params.toString() ? '?' + params.toString() : ''}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      const errorBody = await resp.text().catch(() => '');
+      logger.error(`Analytics upstream failed: ${resp.status} - ${errorBody.slice(0, 200)}`);
+      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`Analytics proxy error: ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch analytics' });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Coverage Report endpoint
+// -----------------------------------------------------------------------------
+
+app.get('/api/v1/coverage', (req, res) => {
+  const SPORTS = ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'];
+
+  // Build odds coverage
+  const oddsCoverage = {};
+  let totalGames = 0;
+  const allOddsBooks = new Set();
+
+  SPORTS.forEach(sport => {
+    const games = latestOddsData?.[sport] || [];
+    const sportCoverage = { games: games.length, books: {} };
+    totalGames += games.length;
+
+    games.forEach(game => {
+      (game.bookmakers || []).forEach(book => {
+        allOddsBooks.add(book.key);
+        if (!sportCoverage.books[book.key]) {
+          sportCoverage.books[book.key] = { games: 0, markets: new Set() };
+        }
+        sportCoverage.books[book.key].games++;
+        (book.markets || []).forEach(m => sportCoverage.books[book.key].markets.add(m.key));
+      });
+    });
+
+    // Convert Sets to arrays
+    Object.keys(sportCoverage.books).forEach(bookKey => {
+      sportCoverage.books[bookKey].markets = Array.from(sportCoverage.books[bookKey].markets);
+    });
+
+    oddsCoverage[sport] = sportCoverage;
+  });
+
+  // Build props coverage
+  const propsCoverage = {};
+  let totalProps = 0;
+  const propsBooks = ['pinnacle', 'bet365', 'fanduel', 'draftkings'];
+
+  const propsCaches = {
+    pinnacle: latestPropsData,
+    bet365: latestBet365PropsData,
+    fanduel: latestFanDuelPropsData,
+    draftkings: latestDraftKingsPropsData
+  };
+
+  SPORTS.forEach(sport => {
+    propsCoverage[sport] = {};
+
+    // Pinnacle (nested books structure)
+    const pinnacleGames = propsCaches.pinnacle?.sports?.[sport] || [];
+    let pinnacleProps = 0;
+    pinnacleGames.forEach(g => {
+      (g.books || []).forEach(b => { pinnacleProps += (b.props || []).length; });
+    });
+    propsCoverage[sport].pinnacle = { games: pinnacleGames.length, props: pinnacleProps };
+    totalProps += pinnacleProps;
+
+    // Other books (props nested in books[] array)
+    ['bet365', 'fanduel', 'draftkings'].forEach(book => {
+      const bookGames = propsCaches[book]?.sports?.[sport] || [];
+      let bookProps = 0;
+      bookGames.forEach(g => {
+        // Props may be under game.books[].props or game.props
+        if (g.books && Array.isArray(g.books)) {
+          g.books.forEach(b => { bookProps += (b.props || []).length; });
+        } else if (g.props) {
+          bookProps += g.props.length;
+        }
+      });
+      propsCoverage[sport][book] = { games: bookGames.length, props: bookProps };
+      totalProps += bookProps;
+    });
+  });
+
+  res.json({
+    success: true,
+    timestamp: new Date().toISOString(),
+    summary: {
+      totalGames,
+      totalProps,
+      oddsBooks: allOddsBooks.size,
+      propsBooks: propsBooks.length
+    },
+    odds: oddsCoverage,
+    props: propsCoverage
+  });
+});
+
+// -----------------------------------------------------------------------------
 // Arbitrage proxy endpoints
 // -----------------------------------------------------------------------------
 
@@ -706,6 +1397,8 @@ app.get('/health', (req, res) => {
     hasScoresData: !!latestScoresData,
     hasPropsData: !!latestPropsData,
     hasBet365PropsData: !!latestBet365PropsData,
+    hasFanDuelPropsData: !!latestFanDuelPropsData,
+    hasDraftKingsPropsData: !!latestDraftKingsPropsData,
   });
 });
 
@@ -744,6 +1437,79 @@ let latestPropsData = null;
 
 // Store latest Bet365 player props data for new connections
 let latestBet365PropsData = null;
+
+// Store latest FanDuel player props data for new connections
+let latestFanDuelPropsData = null;
+
+// Store latest DraftKings player props data for new connections
+let latestDraftKingsPropsData = null;
+
+// Store latest BetMGM player props data for new connections
+let latestBetMGMPropsData = null;
+
+// Store latest Caesars player props data for new connections
+let latestCaesarsPropsData = null;
+
+/**
+ * Deep merge sports data, preserving bookmaker data across updates.
+ * When upstream sends partial updates (missing some bookmakers), we keep
+ * the cached bookmaker data rather than losing it.
+ * @param {Object} prevSports - Previous cached sports data
+ * @param {Object} newSports - Incoming sports data from upstream
+ * @returns {Object} - Merged sports data with all bookmakers preserved
+ */
+function mergeSportsWithBookmakers(prevSports, newSports) {
+  if (!prevSports || typeof prevSports !== 'object') return newSports;
+  if (!newSports || typeof newSports !== 'object') return prevSports;
+
+  const result = { ...prevSports };
+
+  Object.entries(newSports).forEach(([sportKey, newGames]) => {
+    if (!Array.isArray(newGames)) {
+      result[sportKey] = newGames;
+      return;
+    }
+
+    const prevGames = Array.isArray(prevSports[sportKey]) ? prevSports[sportKey] : [];
+
+    // Build index of previous games by eventId for fast lookup
+    const prevByEventId = new Map();
+    prevGames.forEach(g => {
+      const id = g.eventId || g.id;
+      if (id) prevByEventId.set(id, g);
+    });
+
+    // Merge each new game with its previous version
+    result[sportKey] = newGames.map(newGame => {
+      const gameId = newGame.eventId || newGame.id;
+      const prevGame = gameId ? prevByEventId.get(gameId) : null;
+
+      if (!prevGame) return newGame;
+
+      // Merge bookmakers: keep previous bookmakers not in new data
+      const newBookmakers = newGame.bookmakers || [];
+      const prevBookmakers = prevGame.bookmakers || [];
+
+      if (newBookmakers.length === 0) {
+        // New update has no bookmakers, keep previous
+        return { ...newGame, bookmakers: prevBookmakers };
+      }
+
+      // Build set of bookmaker keys in new data
+      const newBookKeys = new Set(newBookmakers.map(b => b.key));
+
+      // Keep previous bookmakers that aren't in the new data
+      const preservedBookmakers = prevBookmakers.filter(b => !newBookKeys.has(b.key));
+
+      // Combine: new bookmakers + preserved previous bookmakers
+      const mergedBookmakers = [...newBookmakers, ...preservedBookmakers];
+
+      return { ...newGame, bookmakers: mergedBookmakers };
+    });
+  });
+
+  return result;
+}
 
 // Initialize upstream connector
 let upstreamConnector = null;
@@ -1045,14 +1811,14 @@ function broadcastOddsUpdate(data) {
     logger.warn(`[Upstream] debug log failed: ${e.message}`);
   }
 
-  // Some upstream payloads may be partial (only a subset of sports).
-  // Merge into cached state so the frontend doesn't "lose" a sport between updates.
+  // Some upstream payloads may be partial (only a subset of sports or bookmakers).
+  // Use deep merge to preserve bookmaker data across updates.
   const incomingSports = data.sports || data;
   if (incomingSports && typeof incomingSports === 'object' && !Array.isArray(incomingSports)) {
     const prev = (latestOddsData && typeof latestOddsData === 'object' && !Array.isArray(latestOddsData))
       ? latestOddsData
       : {};
-    latestOddsData = { ...prev, ...incomingSports };
+    latestOddsData = mergeSportsWithBookmakers(prev, incomingSports);
   } else {
     latestOddsData = incomingSports;
   }
@@ -1184,11 +1950,6 @@ function broadcastPropsUpdate(data) {
 
 // Broadcast Bet365 player props update to all connected clients
 function broadcastBet365PropsUpdate(data) {
-  // DEBUG: Log entry into broadcast function
-  console.log('\n========== BROADCASTING BET365 PROPS DOWNSTREAM ==========');
-  console.log('Timestamp:', new Date().toISOString());
-  console.log('Connected clients:', io.engine.clientsCount);
-
   try {
     const sportsObj = data.sports || {};
     const propsCounts = {};
@@ -1199,7 +1960,6 @@ function broadcastBet365PropsUpdate(data) {
       if (Array.isArray(games)) {
         propsCounts[sportKey] = games.length;
         totalGames += games.length;
-        // Count total props for each game (Bet365 has flat props array)
         games.forEach(game => {
           if (Array.isArray(game.props)) {
             totalProps += game.props.length;
@@ -1208,30 +1968,169 @@ function broadcastBet365PropsUpdate(data) {
       }
     });
 
-    console.log('Sports breakdown:', propsCounts);
-    console.log(`Total: ${totalProps} props from ${totalGames} games`);
-
     logger.debug(`[Upstream] bet365-props-update received. ${totalProps} props from ${totalGames} games`, propsCounts);
   } catch (e) {
-    console.log('ERROR in broadcast:', e.message);
     logger.warn(`[Upstream] bet365 props debug log failed: ${e.message}`);
   }
 
   // Cache for new connections
   latestBet365PropsData = data;
-  console.log('Cached latestBet365PropsData:', !!latestBet365PropsData);
 
   const payload = {
     sports: data.sports || {},
     timestamp: data.timestamp || new Date().toISOString(),
   };
 
-  console.log('Emitting bet365-props-update to', io.engine.clientsCount, 'clients');
-  console.log('Payload sports keys:', Object.keys(payload.sports || {}));
-  console.log('============================================================\n');
-
   io.emit('bet365-props-update', payload);
   logger.info(`Broadcasted Bet365 props update to ${io.engine.clientsCount} clients`);
+}
+
+// Broadcast FanDuel player props update to all connected clients
+function broadcastFanDuelPropsUpdate(data) {
+  try {
+    const sportsObj = data.sports || {};
+    const propsCounts = {};
+    let totalGames = 0;
+    let totalProps = 0;
+
+    Object.entries(sportsObj).forEach(([sportKey, games]) => {
+      if (Array.isArray(games)) {
+        propsCounts[sportKey] = games.length;
+        totalGames += games.length;
+        games.forEach(game => {
+          if (Array.isArray(game.props)) {
+            totalProps += game.props.length;
+          }
+        });
+      }
+    });
+
+    logger.debug(`[Upstream] fanduel-props-update received. ${totalProps} props from ${totalGames} games`, propsCounts);
+  } catch (e) {
+    logger.warn(`[Upstream] fanduel props debug log failed: ${e.message}`);
+  }
+
+  // Cache for new connections
+  latestFanDuelPropsData = data;
+
+  const payload = {
+    sports: data.sports || {},
+    timestamp: data.timestamp || new Date().toISOString(),
+  };
+
+  io.emit('fanduel-props-update', payload);
+  logger.info(`Broadcasted FanDuel props update to ${io.engine.clientsCount} clients`);
+}
+
+// Broadcast DraftKings player props update to all connected clients
+function broadcastDraftKingsPropsUpdate(data) {
+  try {
+    const sportsObj = data.sports || {};
+    const propsCounts = {};
+    let totalGames = 0;
+    let totalProps = 0;
+
+    Object.entries(sportsObj).forEach(([sportKey, games]) => {
+      if (Array.isArray(games)) {
+        propsCounts[sportKey] = games.length;
+        totalGames += games.length;
+        games.forEach(game => {
+          if (Array.isArray(game.props)) {
+            totalProps += game.props.length;
+          }
+        });
+      }
+    });
+
+    logger.debug(`[Upstream] draftkings-props-update received. ${totalProps} props from ${totalGames} games`, propsCounts);
+  } catch (e) {
+    logger.warn(`[Upstream] draftkings props debug log failed: ${e.message}`);
+  }
+
+  // Cache for new connections
+  latestDraftKingsPropsData = data;
+
+  const payload = {
+    sports: data.sports || {},
+    timestamp: data.timestamp || new Date().toISOString(),
+  };
+
+  io.emit('draftkings-props-update', payload);
+  logger.info(`Broadcasted DraftKings props update to ${io.engine.clientsCount} clients`);
+}
+
+// Broadcast BetMGM player props update to all connected clients
+function broadcastBetMGMPropsUpdate(data) {
+  try {
+    const sportsObj = data.sports || {};
+    const propsCounts = {};
+    let totalGames = 0;
+    let totalProps = 0;
+
+    Object.entries(sportsObj).forEach(([sportKey, games]) => {
+      if (Array.isArray(games)) {
+        propsCounts[sportKey] = games.length;
+        totalGames += games.length;
+        games.forEach(game => {
+          if (Array.isArray(game.props)) {
+            totalProps += game.props.length;
+          }
+        });
+      }
+    });
+
+    logger.debug(`[Upstream] betmgm-props-update received. ${totalProps} props from ${totalGames} games`, propsCounts);
+  } catch (e) {
+    logger.warn(`[Upstream] betmgm props debug log failed: ${e.message}`);
+  }
+
+  // Cache for new connections
+  latestBetMGMPropsData = data;
+
+  const payload = {
+    sports: data.sports || {},
+    timestamp: data.timestamp || new Date().toISOString(),
+  };
+
+  io.emit('betmgm-props-update', payload);
+  logger.info(`Broadcasted BetMGM props update to ${io.engine.clientsCount} clients`);
+}
+
+// Broadcast Caesars player props update to all connected clients
+function broadcastCaesarsPropsUpdate(data) {
+  try {
+    const sportsObj = data.sports || {};
+    const propsCounts = {};
+    let totalGames = 0;
+    let totalProps = 0;
+
+    Object.entries(sportsObj).forEach(([sportKey, games]) => {
+      if (Array.isArray(games)) {
+        propsCounts[sportKey] = games.length;
+        totalGames += games.length;
+        games.forEach(game => {
+          if (Array.isArray(game.props)) {
+            totalProps += game.props.length;
+          }
+        });
+      }
+    });
+
+    logger.debug(`[Upstream] caesars-props-update received. ${totalProps} props from ${totalGames} games`, propsCounts);
+  } catch (e) {
+    logger.warn(`[Upstream] caesars props debug log failed: ${e.message}`);
+  }
+
+  // Cache for new connections
+  latestCaesarsPropsData = data;
+
+  const payload = {
+    sports: data.sports || {},
+    timestamp: data.timestamp || new Date().toISOString(),
+  };
+
+  io.emit('caesars-props-update', payload);
+  logger.info(`Broadcasted Caesars props update to ${io.engine.clientsCount} clients`);
 }
 
 // -----------------------------------------------------------------------------
@@ -1443,6 +2342,54 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Handle manual FanDuel props refresh request from client
+  socket.on('request-fanduel-props', () => {
+    logger.debug(`Client ${socket.id} requested FanDuel props refresh`);
+    if (latestFanDuelPropsData) {
+      logger.debug(`[Downstream] re-sending cached FanDuel props to ${socket.id}`);
+      socket.emit('fanduel-props-update', {
+        sports: latestFanDuelPropsData.sports || {},
+        timestamp: latestFanDuelPropsData.timestamp || new Date().toISOString(),
+      });
+    }
+  });
+
+  // Handle manual DraftKings props refresh request from client
+  socket.on('request-draftkings-props', () => {
+    logger.debug(`Client ${socket.id} requested DraftKings props refresh`);
+    if (latestDraftKingsPropsData) {
+      logger.debug(`[Downstream] re-sending cached DraftKings props to ${socket.id}`);
+      socket.emit('draftkings-props-update', {
+        sports: latestDraftKingsPropsData.sports || {},
+        timestamp: latestDraftKingsPropsData.timestamp || new Date().toISOString(),
+      });
+    }
+  });
+
+  // Handle manual BetMGM props refresh request from client
+  socket.on('request-betmgm-props', () => {
+    logger.debug(`Client ${socket.id} requested BetMGM props refresh`);
+    if (latestBetMGMPropsData) {
+      logger.debug(`[Downstream] re-sending cached BetMGM props to ${socket.id}`);
+      socket.emit('betmgm-props-update', {
+        sports: latestBetMGMPropsData.sports || {},
+        timestamp: latestBetMGMPropsData.timestamp || new Date().toISOString(),
+      });
+    }
+  });
+
+  // Handle manual Caesars props refresh request from client
+  socket.on('request-caesars-props', () => {
+    logger.debug(`Client ${socket.id} requested Caesars props refresh`);
+    if (latestCaesarsPropsData) {
+      logger.debug(`[Downstream] re-sending cached Caesars props to ${socket.id}`);
+      socket.emit('caesars-props-update', {
+        sports: latestCaesarsPropsData.sports || {},
+        timestamp: latestCaesarsPropsData.timestamp || new Date().toISOString(),
+      });
+    }
+  });
+
   // Handle client disconnect
   socket.on('disconnect', (reason) => {
     clearSocketWatchers(socket.id);
@@ -1467,6 +2414,10 @@ server.listen(PORT, () => {
     onScoresUpdate: broadcastScoresUpdate,
     onPropsUpdate: broadcastPropsUpdate,
     onBet365PropsUpdate: broadcastBet365PropsUpdate,
+    onFanDuelPropsUpdate: broadcastFanDuelPropsUpdate,
+    onDraftKingsPropsUpdate: broadcastDraftKingsPropsUpdate,
+    onBetMGMPropsUpdate: broadcastBetMGMPropsUpdate,
+    onCaesarsPropsUpdate: broadcastCaesarsPropsUpdate,
     onConnect: () => logger.info('Upstream connected'),
     onDisconnect: (reason) => logger.warn(`Upstream disconnected: ${reason}`),
     onError: (error) => logger.error(`Upstream error: ${error.message}`),
