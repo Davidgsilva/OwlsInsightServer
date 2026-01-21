@@ -1452,6 +1452,12 @@ let latestDraftKingsPropsData = null;
 // Track downstream props history requests for targeted responses
 const propsHistoryRequests = new Map();
 const PROPS_HISTORY_REQUEST_TTL_MS = 30_000;
+const MAX_PENDING_PROPS_HISTORY_REQUESTS = 10000;
+
+// Rate limiting for props history requests per socket
+const propsHistoryRateLimits = new Map();
+const PROPS_HISTORY_RATE_LIMIT_WINDOW_MS = 1000;
+const PROPS_HISTORY_MAX_REQUESTS_PER_WINDOW = 10;
 
 setInterval(() => {
   const now = Date.now();
@@ -2082,11 +2088,11 @@ function broadcastPropsHistoryResponse(data) {
   if (!data || typeof data !== 'object') return;
   const requestId = data.requestId;
   if (requestId) {
-    if (!propsHistoryRequests.has(requestId)) {
-      logger.warn(`Props history response received for unknown requestId ${requestId}`);
+    const requestMeta = propsHistoryRequests.get(requestId);
+    if (!requestMeta) {
+      logger.debug(`Props history response for requestId ${requestId} - request expired or not found`);
       return;
     }
-    const requestMeta = propsHistoryRequests.get(requestId);
     propsHistoryRequests.delete(requestId);
     const targetSocket = io.sockets.sockets.get(requestMeta.socketId);
     if (targetSocket) {
@@ -2416,6 +2422,34 @@ io.on('connection', (socket) => {
     const book = payload?.book;
     const hours = payload?.hours;
 
+    // Rate limiting per socket
+    const now = Date.now();
+    const rateInfo = propsHistoryRateLimits.get(socket.id) || { count: 0, windowStart: now };
+    if (now - rateInfo.windowStart > PROPS_HISTORY_RATE_LIMIT_WINDOW_MS) {
+      rateInfo.count = 0;
+      rateInfo.windowStart = now;
+    }
+    if (rateInfo.count >= PROPS_HISTORY_MAX_REQUESTS_PER_WINDOW) {
+      socket.emit('props-history-response', {
+        success: false,
+        requestId,
+        error: 'Rate limit exceeded, try again later',
+      });
+      return;
+    }
+    rateInfo.count++;
+    propsHistoryRateLimits.set(socket.id, rateInfo);
+
+    // Check max pending requests to prevent memory exhaustion
+    if (propsHistoryRequests.size >= MAX_PENDING_PROPS_HISTORY_REQUESTS) {
+      socket.emit('props-history-response', {
+        success: false,
+        requestId,
+        error: 'Server overloaded, try again later',
+      });
+      return;
+    }
+
     if (!gameId || !player || !category) {
       socket.emit('props-history-response', {
         success: false,
@@ -2476,6 +2510,7 @@ io.on('connection', (socket) => {
     propsHistoryRequests.forEach((value, key) => {
       if (value.socketId === socket.id) propsHistoryRequests.delete(key);
     });
+    propsHistoryRateLimits.delete(socket.id);
     logger.info(`Client disconnected: ${socket.id} (Reason: ${reason}, Remaining: ${io.engine.clientsCount})`);
   });
 });
