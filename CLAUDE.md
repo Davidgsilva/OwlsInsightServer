@@ -148,6 +148,49 @@ Optional:
 - `OWLS_INSIGHT_API_BASE_URL` - Override base URL for history API (derived from `UPSTREAM_WS_URL` if not set)
 - `DEBUG_OWLS_INSIGHT` (default: false) - Set to `true` for verbose debug logging of data flow
 
+## Multi-Repo Architecture
+
+Three repos work together for the Owls Insight system:
+
+| Repo | Path | Purpose |
+|------|------|---------|
+| **WiseSportsAI** | `~/Projects/WiseSportsServices/WiseSportsAI` | Frontend React app |
+| **OwlsInsightServer** | `~/Projects/WiseSportsServices/OwlsInsightServer` | WebSocket proxy (this repo) |
+| **nba-odds-app** | `~/Projects/WiseSportsServices/nba-odds-app` | Upstream API server + polling |
+
+### Request Flow
+
+```
+WiseSportsAI (frontend)
+    │
+    │  REST: GET /api/v1/{sport}/props/history?game_id=X&player=Y&category=Z
+    │  WS:   emit('request-props-history', {gameId, player, category})
+    ▼
+OwlsInsightServer (proxy) ← adds Authorization header with API key
+    │
+    │  GET http://owls-insight-api-server/api/v1/{sport}/props/history?game_id=X&player=Y&category=Z
+    ▼
+nba-odds-app (API server) ← queries Redis for historical data
+```
+
+### Props History API
+
+**Required params:** `game_id`, `player`, `category`
+
+```bash
+# REST
+curl 'https://ws.owlsinsight.com/api/v1/nba/props/history?game_id=nba:BOS@SAC-20260122&player=Jaylen%20Brown&category=points'
+
+# WebSocket
+socket.emit('request-props-history', {
+  requestId: 'unique-id',
+  gameId: 'nba:BOS@SAC-20260122',
+  player: 'Jaylen Brown',
+  category: 'points'
+});
+socket.on('props-history-response', (data) => { ... });
+```
+
 ## Production Ingress Ownership (CRITICAL)
 
 **This repo manages the ONLY production ingress for ws.owlsinsight.com.**
