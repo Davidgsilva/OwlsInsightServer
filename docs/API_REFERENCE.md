@@ -6,10 +6,12 @@
 
 ---
 
-## Odds
+## Games & Odds
+
+Use the odds endpoint to get all available games:
 
 ```bash
-# All odds
+# All games (returns game IDs, teams, commence_time)
 curl 'https://ws.owlsinsight.com/api/v1/nba/odds' -H 'Authorization: Bearer KEY'
 
 # Specific game
