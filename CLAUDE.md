@@ -37,9 +37,9 @@ Upstream Odds Provider (WebSocket)
 
 ### Key Components
 
-- **src/index.js** - Main entry point. Sets up Express server, Socket.io for clients, initializes upstream connector, manages cached data (`latestOddsData`, `latestScoresData`, `latestPropsData`, `latestBet365PropsData`, `latestFanDuelPropsData`, `latestDraftKingsPropsData`, `openingLines`), REST API proxies with caching, live score merging, and handles graceful shutdown.
+- **src/index.js** - Main entry point. Sets up Express server, Socket.io for clients, initializes upstream connector, manages cached data (`latestOddsData`, `latestScoresData`, `latestPropsData`, `latestBet365PropsData`, `latestFanDuelPropsData`, `latestDraftKingsPropsData`, `latestBetMGMPropsData`, `latestCaesarsPropsData`, `openingLines`), REST API proxies with caching, live score merging, and handles graceful shutdown.
 
-- **src/services/upstreamConnector.js** - Socket.io client that connects to the upstream odds provider. Handles authentication (API key via auth object, query params, and headers), reconnection logic, and event subscriptions. On connect, subscribes to sports: `['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf']` and books: `['pinnacle', 'fanduel', 'draftkings', 'betmgm', 'bet365', 'caesars']`. Also subscribes to player props from Pinnacle, Bet365, FanDuel, and DraftKings.
+- **src/services/upstreamConnector.js** - Socket.io client that connects to the upstream odds provider. Handles authentication (API key via auth object, query params, and headers), reconnection logic, and event subscriptions. On connect, subscribes to sports: `['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf']` and books: `['pinnacle', 'fanduel', 'draftkings', 'betmgm', 'bet365', 'caesars']`. Also subscribes to player props from Pinnacle, Bet365, FanDuel, DraftKings, BetMGM, and Caesars.
 
 - **src/services/dataTransformer.js** - Normalizes upstream data to Owls Insight format. Handles multiple input formats including The Odds API format (array of events) and pre-formatted sports objects. Calculates average odds across bookmakers. Output structure: `{ sports: { nba: [], nfl: [], nhl: [], ncaab: [], ncaaf: [] }, openingLines: {} }`
 
@@ -71,6 +71,8 @@ Team name aliases are defined in `TEAM_ALIASES` (e.g., `usc` → `southerncalifo
 - `bet365-props-update` - Broadcast Bet365 player props data
 - `fanduel-props-update` - Broadcast FanDuel player props data
 - `draftkings-props-update` - Broadcast DraftKings player props data
+- `betmgm-props-update` - Broadcast BetMGM player props data
+- `caesars-props-update` - Broadcast Caesars player props data
 - `history-update` - Push history data for single-book subscription
 - `history-multi-update` - Push history data for multi-book subscription
 
@@ -81,6 +83,8 @@ Team name aliases are defined in `TEAM_ALIASES` (e.g., `usc` → `southerncalifo
 - `request-bet365-props` - Request latest cached Bet365 props
 - `request-fanduel-props` - Request latest cached FanDuel props
 - `request-draftkings-props` - Request latest cached DraftKings props
+- `request-betmgm-props` - Request latest cached BetMGM props
+- `request-caesars-props` - Request latest cached Caesars props
 - `watch-history` - Subscribe to history updates for a specific event/book/market
 - `watch-history-multi` - Subscribe to multi-book history updates for line movement charts
 - `unwatch-history` - Unsubscribe from history updates
@@ -120,6 +124,9 @@ Team name aliases are defined in `TEAM_ALIASES` (e.g., `usc` → `southerncalifo
 
 **Analytics:**
 - `GET /api/odds/analytics?eventId=&book=&market=&hours=&granularity=` - Odds analytics
+
+**Coverage:**
+- `GET /api/v1/coverage` - Coverage report showing games and props counts per sport/book
 
 Valid sports for REST endpoints: `nba`, `ncaab`, `nfl`, `nhl`, `ncaaf`
 

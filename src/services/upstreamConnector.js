@@ -428,16 +428,6 @@ class UpstreamConnector {
     return this.connected;
   }
 
-  /**
-   * Send a message to upstream (if needed)
-   */
-  emit(event, data) {
-    if (this.socket && this.connected) {
-      this.socket.emit(event, data);
-    } else {
-      logger.warn(`Cannot emit ${event}: not connected to upstream`);
-    }
-  }
 }
 
 module.exports = UpstreamConnector;
