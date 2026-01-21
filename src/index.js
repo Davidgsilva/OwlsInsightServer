@@ -1069,7 +1069,8 @@ app.get('/api/v1/:sport/props/draftkings', async (req, res) => {
 // Props history - fetches historical player props from upstream
 app.get('/api/v1/:sport/props/history', async (req, res) => {
   const { sport } = req.params;
-  const { player, category, prop_type, hours, book } = req.query;
+  const { game_id, eventId, player, category, prop_type, hours, book } = req.query;
+  const resolvedGameId = game_id || eventId;
 
   if (!VALID_SPORTS.includes(sport)) {
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
@@ -1083,6 +1084,10 @@ app.get('/api/v1/:sport/props/history', async (req, res) => {
     }
 
     const params = new URLSearchParams();
+    if (resolvedGameId) {
+      params.append('game_id', resolvedGameId);
+      params.append('eventId', resolvedGameId);
+    }
     if (player) params.append('player', player);
     if (category) params.append('category', category);
     if (prop_type) params.append('prop_type', prop_type);
@@ -1443,6 +1448,19 @@ let latestFanDuelPropsData = null;
 
 // Store latest DraftKings player props data for new connections
 let latestDraftKingsPropsData = null;
+
+// Track downstream props history requests for targeted responses
+const propsHistoryRequests = new Map();
+const PROPS_HISTORY_REQUEST_TTL_MS = 30_000;
+
+setInterval(() => {
+  const now = Date.now();
+  propsHistoryRequests.forEach((value, key) => {
+    if (now - value.createdAt > PROPS_HISTORY_REQUEST_TTL_MS) {
+      propsHistoryRequests.delete(key);
+    }
+  });
+}, PROPS_HISTORY_REQUEST_TTL_MS).unref();
 
 // Store latest BetMGM player props data for new connections
 let latestBetMGMPropsData = null;
@@ -2059,6 +2077,29 @@ function broadcastDraftKingsPropsUpdate(data) {
   logger.info(`Broadcasted DraftKings props update to ${io.engine.clientsCount} clients`);
 }
 
+// Forward props history responses to the requesting client (by requestId)
+function broadcastPropsHistoryResponse(data) {
+  if (!data || typeof data !== 'object') return;
+  const requestId = data.requestId;
+  if (requestId) {
+    if (!propsHistoryRequests.has(requestId)) {
+      logger.warn(`Props history response received for unknown requestId ${requestId}`);
+      return;
+    }
+    const requestMeta = propsHistoryRequests.get(requestId);
+    propsHistoryRequests.delete(requestId);
+    const targetSocket = io.sockets.sockets.get(requestMeta.socketId);
+    if (targetSocket) {
+      targetSocket.emit('props-history-response', data);
+    } else {
+      logger.warn(`Props history response target socket not found for requestId ${requestId}`);
+    }
+    return;
+  }
+
+  io.emit('props-history-response', data);
+}
+
 // Broadcast BetMGM player props update to all connected clients
 function broadcastBetMGMPropsUpdate(data) {
   try {
@@ -2366,6 +2407,45 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Handle props history request from client (forward upstream)
+  socket.on('request-props-history', (payload) => {
+    const requestId = payload?.requestId || `props-history-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const gameId = payload?.gameId || payload?.game_id || payload?.eventId;
+    const player = payload?.player;
+    const category = payload?.category;
+    const book = payload?.book;
+    const hours = payload?.hours;
+
+    if (!gameId || !player || !category) {
+      socket.emit('props-history-response', {
+        success: false,
+        requestId,
+        error: 'Missing required parameters: gameId, player, category',
+      });
+      return;
+    }
+
+    propsHistoryRequests.set(requestId, { socketId: socket.id, createdAt: Date.now() });
+
+    const forwarded = upstreamConnector?.emit('request-props-history', {
+      requestId,
+      gameId,
+      player,
+      category,
+      book,
+      hours,
+    });
+
+    if (!forwarded) {
+      propsHistoryRequests.delete(requestId);
+      socket.emit('props-history-response', {
+        success: false,
+        requestId,
+        error: 'Upstream not connected',
+      });
+    }
+  });
+
   // Handle manual BetMGM props refresh request from client
   socket.on('request-betmgm-props', () => {
     logger.debug(`Client ${socket.id} requested BetMGM props refresh`);
@@ -2393,6 +2473,9 @@ io.on('connection', (socket) => {
   // Handle client disconnect
   socket.on('disconnect', (reason) => {
     clearSocketWatchers(socket.id);
+    propsHistoryRequests.forEach((value, key) => {
+      if (value.socketId === socket.id) propsHistoryRequests.delete(key);
+    });
     logger.info(`Client disconnected: ${socket.id} (Reason: ${reason}, Remaining: ${io.engine.clientsCount})`);
   });
 });
@@ -2418,6 +2501,7 @@ server.listen(PORT, () => {
     onDraftKingsPropsUpdate: broadcastDraftKingsPropsUpdate,
     onBetMGMPropsUpdate: broadcastBetMGMPropsUpdate,
     onCaesarsPropsUpdate: broadcastCaesarsPropsUpdate,
+    onPropsHistoryResponse: broadcastPropsHistoryResponse,
     onConnect: () => logger.info('Upstream connected'),
     onDisconnect: (reason) => logger.warn(`Upstream disconnected: ${reason}`),
     onError: (error) => logger.error(`Upstream error: ${error.message}`),

@@ -27,6 +27,7 @@ class UpstreamConnector {
     this.onDraftKingsPropsUpdate = options.onDraftKingsPropsUpdate || (() => {});
     this.onBetMGMPropsUpdate = options.onBetMGMPropsUpdate || (() => {});
     this.onCaesarsPropsUpdate = options.onCaesarsPropsUpdate || (() => {});
+    this.onPropsHistoryResponse = options.onPropsHistoryResponse || (() => {});
     this.onConnect = options.onConnect || (() => {});
     this.onDisconnect = options.onDisconnect || (() => {});
     this.onError = options.onError || (() => {});
@@ -38,6 +39,15 @@ class UpstreamConnector {
 
     // Event name mapping (configure based on upstream server)
     this.upstreamEventName = process.env.UPSTREAM_EVENT_NAME || 'odds-update';
+  }
+
+  emit(eventName, payload) {
+    if (!this.socket || !this.connected) {
+      logger.warn(`Cannot emit ${eventName}; upstream not connected`);
+      return false;
+    }
+    this.socket.emit(eventName, payload);
+    return true;
   }
 
   /**
@@ -347,6 +357,12 @@ class UpstreamConnector {
     // Handle Caesars props subscription confirmation
     this.socket.on('caesars-props-subscribed', (subscription) => {
       logger.info(`Caesars props subscription confirmed: ${JSON.stringify(subscription)}`);
+    });
+
+    // Handle props history response from upstream
+    this.socket.on('props-history-response', (data) => {
+      logger.debug('Received props-history-response from upstream');
+      this.onPropsHistoryResponse(data);
     });
 
     // Handle additional event names if configured
