@@ -87,7 +87,7 @@ spec:
 
       containers:
         - name: owls-insight-server
-          image: 482566359918.dkr.ecr.us-east-1.amazonaws.com/owls-insight-server:v1.3.0
+          image: 482566359918.dkr.ecr.us-east-1.amazonaws.com/owls-insight-server:v1.11.0
           imagePullPolicy: Always
 
           ports:
