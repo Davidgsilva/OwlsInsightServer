@@ -200,6 +200,48 @@ app.get('/api/history', async (req, res) => {
   }
 });
 
+// Single-side history endpoint - proxies to upstream API server
+// This matches the nba-odds-app /api/odds/history endpoint format
+app.get('/api/odds/history', async (req, res) => {
+  const { eventId, book, market, side, hours } = req.query;
+  if (!eventId || !book || !market || !side) {
+    return res.status(400).json({ success: false, error: 'eventId, book, market, side are required' });
+  }
+
+  try {
+    const apiBase = getApiBaseUrl();
+    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    if (!apiBase || !apiKey) {
+      return res.status(502).json({ success: false, error: 'history proxy not configured' });
+    }
+
+    const params = new URLSearchParams({
+      eventId: String(eventId),
+      book: String(book),
+      market: String(market),
+      side: String(side),
+    });
+    if (hours) params.set('hours', String(hours));
+
+    const url = `${apiBase}/api/odds/history?${params.toString()}`;
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      logger.error(`Odds history proxy failed: ${resp.status} - ${body.slice(0, 200)}`);
+      return res.status(resp.status).json({ success: false, error: `upstream returned ${resp.status}` });
+    }
+
+    const data = await resp.json();
+    return res.json(data);
+  } catch (err) {
+    logger.error(`Odds history proxy error: ${err.message}`);
+    return res.status(502).json({ success: false, error: 'failed to fetch odds history' });
+  }
+});
+
 // -----------------------------------------------------------------------------
 // Live Scores proxy endpoints
 // -----------------------------------------------------------------------------
@@ -1638,13 +1680,43 @@ function buildScoreIndex(scoresData) {
   if (!scoresData || typeof scoresData !== 'object') return { byId, byTeams, allScores };
 
   const sportBuckets = scoresData.sports || scoresData.data?.sports || {};
-  Object.values(sportBuckets).forEach((events) => {
+
+  // DEBUG: Log raw scores data structure
+  if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
+    const sportKeys = Object.keys(sportBuckets);
+    console.log('[DEBUG_OWLS_INSIGHT] buildScoreIndex - sports:', sportKeys);
+    sportKeys.forEach((sport) => {
+      const events = sportBuckets[sport];
+      if (Array.isArray(events) && events.length > 0) {
+        // Log first live event's raw status data
+        const liveEvent = events.find((e) => e?.status?.state === 'in' || e?.status === 'live' || e?.status === 'in');
+        if (liveEvent) {
+          console.log(`[DEBUG_OWLS_INSIGHT] ${sport} LIVE event raw data:`, {
+            id: liveEvent.id,
+            name: liveEvent.name,
+            status: liveEvent.status,
+            statusType: typeof liveEvent.status,
+            clock: liveEvent.clock,
+            displayClock: liveEvent.displayClock,
+            period: liveEvent.period,
+            home: liveEvent.home,
+            away: liveEvent.away,
+          });
+        }
+      }
+    });
+  }
+
+  Object.entries(sportBuckets).forEach(([sportKey, events]) => {
     if (!Array.isArray(events)) return;
     events.forEach((ev) => {
       const id = getEventKey(ev);
       const { home, away } = getHomeAwayNames(ev);
       const scores = getHomeAwayScores(ev);
       const teamsKey = buildTeamsKey(away, home);
+
+      // Status may be nested in ev.status object from live scores API
+      const statusObj = ev?.status && typeof ev.status === 'object' ? ev.status : null;
 
       const normalized = {
         id,
@@ -1654,11 +1726,24 @@ function buildScoreIndex(scoresData) {
         awayKey: normalizeTeamKey(away),
         home_score: scores.home,
         away_score: scores.away,
-        detail: ev?.detail || ev?.status_detail || ev?.statusDetail || null,
-        clock: ev?.clock || ev?.displayClock || null,
-        period: ev?.period ?? null,
+        detail: statusObj?.detail || ev?.detail || ev?.status_detail || ev?.statusDetail || null,
+        clock: statusObj?.displayClock || ev?.clock || ev?.displayClock || null,
+        period: statusObj?.period ?? ev?.period ?? null,
         updatedAt: ev?.timestamp || ev?.updatedAt || ev?.updated_at || null,
       };
+
+      // DEBUG: Log normalized live events with clock/period
+      if (process.env.DEBUG_OWLS_INSIGHT === 'true' && (statusObj?.state === 'in' || ev?.status === 'live')) {
+        console.log(`[DEBUG_OWLS_INSIGHT] ${sportKey} normalized live score:`, {
+          id: normalized.id,
+          teams: `${normalized.away} @ ${normalized.home}`,
+          scores: `${normalized.away_score} - ${normalized.home_score}`,
+          clock: normalized.clock,
+          period: normalized.period,
+          detail: normalized.detail,
+          rawStatusObj: statusObj,
+        });
+      }
 
       if (id) byId.set(String(id), normalized);
       if (teamsKey) byTeams.set(teamsKey, normalized);
@@ -1785,6 +1870,19 @@ function mergeScoresIntoSports(sports, scoresData) {
 
       matchedCount++;
       if (wasFuzzyMatch) fuzzyMatchedCount++;
+
+      // DEBUG: Log when merging live scores with clock/period data
+      if (process.env.DEBUG_OWLS_INSIGHT === 'true' && (score.clock || score.period)) {
+        console.log('[DEBUG_OWLS_INSIGHT] Merging clock/period into odds event:', {
+          sport: sportKey,
+          teams: `${away} @ ${home}`,
+          scores: `${score.away_score} - ${score.home_score}`,
+          clock: score.clock,
+          period: score.period,
+          detail: score.detail,
+        });
+      }
+
       return {
         ...ev,
         home_score: score.home_score,
@@ -1903,14 +2001,31 @@ function broadcastScoresUpdate(data) {
         console.log('[DEBUG_OWLS_INSIGHT] Sample score event:', {
           sport: sampleSport,
           eventId: sample?.eventId || sample?.id || sample?.event_id,
-          homeTeam: sample?.home_team || sample?.homeTeam || sample?.home?.name,
-          awayTeam: sample?.away_team || sample?.awayTeam || sample?.away?.name,
+          homeTeam: sample?.home_team || sample?.homeTeam || sample?.home?.name || sample?.home?.team?.displayName,
+          awayTeam: sample?.away_team || sample?.awayTeam || sample?.away?.name || sample?.away?.team?.displayName,
           homeScore: sample?.home_score ?? sample?.homeScore ?? sample?.home?.score ?? sample?.score?.home,
           awayScore: sample?.away_score ?? sample?.awayScore ?? sample?.away?.score ?? sample?.score?.away,
           allKeys: Object.keys(sample || {}),
           // Log raw home/away objects to see actual structure
           rawHome: sample?.home,
           rawAway: sample?.away,
+        });
+
+        // Log clock/period/status info
+        console.log('[DEBUG_OWLS_INSIGHT] Sample score STATUS/CLOCK:', {
+          sport: sampleSport,
+          eventId: sample?.eventId || sample?.id,
+          status: sample?.status,
+          statusType: typeof sample?.status,
+          // Direct fields
+          clock: sample?.clock,
+          displayClock: sample?.displayClock,
+          period: sample?.period,
+          // Nested in status object
+          'status.state': sample?.status?.state,
+          'status.detail': sample?.status?.detail,
+          'status.displayClock': sample?.status?.displayClock,
+          'status.period': sample?.status?.period,
         });
       }
     }

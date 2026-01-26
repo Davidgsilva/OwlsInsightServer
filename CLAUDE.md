@@ -150,7 +150,7 @@ Optional:
 
 ## Multi-Repo Architecture
 
-Three repos work together for the Owls Insight system:
+Three repos work together for the Owls Insight system. See `../CLAUDE.md` for cross-repo workflows.
 
 | Repo | Path | Purpose |
 |------|------|---------|

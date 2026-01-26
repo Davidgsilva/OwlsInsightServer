@@ -1,7 +1,7 @@
 # Owls Insight API Reference
 
 **Base URL:** `https://ws.owlsinsight.com`
-**Auth Header:** `Authorization: Bearer YOUR_API_KEY`
+**Auth Header:** `Authorization: Bearer <API_KEY>`
 **Sports:** `nba`, `ncaab`, `nfl`, `nhl`, `ncaaf`, `mlb`
 
 ---
