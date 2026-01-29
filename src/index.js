@@ -668,6 +668,43 @@ app.get('/api/v1/:sport/totals', async (req, res) => {
 // -----------------------------------------------------------------------------
 
 // Props proxy - fetches from upstream and caches
+// Helper to merge book data from multiple sources into games
+// Note: Each source book cache contains games with a single book entry (books[0])
+const mergeBookIntoGames = (gamesMap, bookData, sport) => {
+  if (!bookData?.sports?.[sport]) return;
+  const bookGames = bookData.sports[sport] || [];
+  for (const bookGame of bookGames) {
+    const book = bookGame.books?.[0];
+    if (!book) continue;
+
+    // Find matching game by gameId first (most reliable)
+    let matchingGame = gamesMap.get(bookGame.gameId);
+
+    // Fallback: try matching by team names (handles gameId format differences)
+    if (!matchingGame && bookGame.homeTeam && bookGame.awayTeam) {
+      const teamsKey = `${bookGame.homeTeam}|${bookGame.awayTeam}`;
+      matchingGame = Array.from(gamesMap.values()).find(g =>
+        `${g.homeTeam}|${g.awayTeam}` === teamsKey
+      );
+    }
+
+    if (matchingGame) {
+      // Ensure books array exists (defensive check)
+      matchingGame.books = matchingGame.books || [];
+      // Add book to existing game if not already present
+      if (!matchingGame.books.some(b => b.key === book.key)) {
+        matchingGame.books.push(book);
+      }
+    } else {
+      // Add as new game - deep copy to prevent cache mutation
+      gamesMap.set(bookGame.gameId, {
+        ...bookGame,
+        books: bookGame.books ? bookGame.books.map(b => ({ ...b, props: [...(b.props || [])] })) : []
+      });
+    }
+  }
+};
+
 app.get('/api/v1/:sport/props', async (req, res) => {
   const { sport } = req.params;
   const { game_id, player, category } = req.query;
@@ -678,14 +715,34 @@ app.get('/api/v1/:sport/props', async (req, res) => {
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
-  // First try to return cached data from WebSocket
-  if (latestPropsData) {
-    console.log(`[DEBUG Props] Using cached Pinnacle props data for ${sport}`);
-    console.log(`[DEBUG Props] Cache has sports:`, Object.keys(latestPropsData.sports || {}));
-    const sportGames = latestPropsData.sports?.[sport] || [];
-    console.log(`[DEBUG Props] ${sport} has ${sportGames.length} games in cache`);
-    const sportData = latestPropsData.sports?.[sport] || [];
-    let filteredData = sportData;
+  // Build merged props from all cached book data
+  const hasCachedData = latestPropsData || latestFanDuelPropsData || latestDraftKingsPropsData ||
+                        latestBet365PropsData || latestBetMGMPropsData || latestCaesarsPropsData;
+
+  if (hasCachedData) {
+    // Start with Pinnacle data as base
+    const gamesMap = new Map();
+    const pinnacleGames = latestPropsData?.sports?.[sport] || [];
+    for (const game of pinnacleGames) {
+      gamesMap.set(game.gameId, { ...game, books: [...(game.books || [])] });
+    }
+
+    // Merge in other book data
+    mergeBookIntoGames(gamesMap, latestFanDuelPropsData, sport);
+    mergeBookIntoGames(gamesMap, latestDraftKingsPropsData, sport);
+    mergeBookIntoGames(gamesMap, latestBet365PropsData, sport);
+    mergeBookIntoGames(gamesMap, latestBetMGMPropsData, sport);
+    mergeBookIntoGames(gamesMap, latestCaesarsPropsData, sport);
+
+    let filteredData = Array.from(gamesMap.values());
+
+    const bookCounts = {};
+    filteredData.forEach(g => {
+      (g.books || []).forEach(b => {
+        bookCounts[b.key] = (bookCounts[b.key] || 0) + (b.props || []).length;
+      });
+    });
+    console.log(`[DEBUG Props] Merged book counts for ${sport}:`, bookCounts);
 
     // Apply filters if provided
     if (game_id) {
@@ -724,21 +781,27 @@ app.get('/api/v1/:sport/props', async (req, res) => {
       });
     });
 
-    console.log(`[DEBUG Props] Returning ${propsCount} Pinnacle props for ${sport} from ${filteredData.length} games (cached)`);
+    const booksInResponse = new Set();
+    filteredData.forEach(g => (g.books || []).forEach(b => booksInResponse.add(b.key)));
+    console.log(`[DEBUG Props] Returning ${propsCount} props from ${Array.from(booksInResponse).join(', ')} for ${sport} from ${filteredData.length} games (cached)`);
 
     return res.json({
       success: true,
       data: filteredData,
       meta: {
         sport,
-        timestamp: latestPropsData.timestamp,
+        timestamp: latestPropsData?.timestamp ||
+                   latestDraftKingsPropsData?.timestamp ||
+                   latestFanDuelPropsData?.timestamp ||
+                   new Date().toISOString(),
         propsReturned: propsCount,
         gamesReturned: filteredData.length,
         cached: true,
+        booksIncluded: Array.from(booksInResponse),
       }
     });
   } else {
-    console.log(`[DEBUG Props] No cached Pinnacle props data available for ${sport}`);
+    console.log(`[DEBUG Props] No cached props data available for ${sport}`);
   }
 
   // Fall back to upstream API
@@ -2139,6 +2202,14 @@ function broadcastFanDuelPropsUpdate(data) {
         games.forEach(game => {
           if (Array.isArray(game.props)) {
             totalProps += game.props.length;
+          }
+          // Also count props inside books array
+          if (Array.isArray(game.books)) {
+            game.books.forEach(book => {
+              if (Array.isArray(book.props)) {
+                totalProps += book.props.length;
+              }
+            });
           }
         });
       }
