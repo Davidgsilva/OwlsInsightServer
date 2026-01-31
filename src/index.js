@@ -16,6 +16,78 @@ app.use(cors({ origin: CORS_ORIGIN }));
 app.use(express.json());
 
 // -----------------------------------------------------------------------------
+// API Key Authentication Helpers
+// -----------------------------------------------------------------------------
+
+/**
+ * Extract API key from Authorization header
+ * Supports both "Bearer <key>" and just "<key>"
+ */
+function extractApiKey(authHeader) {
+  if (!authHeader) return null;
+  return authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
+}
+
+/**
+ * Authentication middleware - validates client API key via upstream
+ * Returns validation result with tier and limits info
+ */
+async function validateClientApiKey(req) {
+  const clientApiKey = extractApiKey(req.headers.authorization);
+
+  if (!clientApiKey) {
+    return { valid: false, status: 401, error: 'API key required' };
+  }
+
+  // Call upstream to validate the key
+  const apiBase = getApiBaseUrl();
+  const proxyApiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+
+  if (!apiBase || !proxyApiKey) {
+    return { valid: false, status: 502, error: 'Proxy not configured' };
+  }
+
+  try {
+    const resp = await fetch(`${apiBase}/api/internal/validate-key`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${proxyApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ apiKey: clientApiKey }),
+    });
+
+    if (!resp.ok) {
+      return { valid: false, status: resp.status, error: 'Authentication failed' };
+    }
+
+    const validation = await resp.json();
+
+    if (!validation.valid) {
+      return { valid: false, status: 401, error: validation.error || 'Invalid API key' };
+    }
+
+    return {
+      valid: true,
+      userId: validation.userId,
+      tier: validation.tier,
+      limits: validation.limits,
+      clientApiKey,
+    };
+  } catch (err) {
+    logger.error(`API key validation error: ${err.message}`);
+    return { valid: false, status: 500, error: 'Authentication service unavailable' };
+  }
+}
+
+/**
+ * Check if the tier is allowed to access props endpoints
+ */
+function canAccessProps(tier) {
+  return tier === 'rookie' || tier === 'mvp';
+}
+
+// -----------------------------------------------------------------------------
 // History proxy endpoint
 // -----------------------------------------------------------------------------
 
@@ -186,6 +258,12 @@ function clearSocketWatchers(socketId) {
 }
 
 app.get('/api/history', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
   const { eventId, book, market, hours } = req.query;
   if (!eventId || !book || !market) {
     return res.status(400).json({ success: false, error: 'eventId, book, market are required' });
@@ -203,6 +281,12 @@ app.get('/api/history', async (req, res) => {
 // Single-side history endpoint - proxies to upstream API server
 // This matches the nba-odds-app /api/odds/history endpoint format
 app.get('/api/odds/history', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
   const { eventId, book, market, side, hours } = req.query;
   if (!eventId || !book || !market || !side) {
     return res.status(400).json({ success: false, error: 'eventId, book, market, side are required' });
@@ -299,6 +383,12 @@ async function fetchLiveScoresFromUpstream(sport = null) {
 
 // All sports live scores
 app.get('/api/v1/scores/live', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
   try {
     // First try to return cached data from WebSocket
     if (latestScoresData) {
@@ -321,6 +411,12 @@ app.get('/api/v1/scores/live', async (req, res) => {
 // Sport-specific live scores
 const VALID_SPORTS = ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'];
 app.get('/api/v1/:sport/scores/live', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
   const { sport } = req.params;
 
   if (!VALID_SPORTS.includes(sport)) {
@@ -365,6 +461,12 @@ function filterBookmakerMarkets(bookmakers, marketKey) {
 
 // All odds for a sport (from WebSocket cache)
 app.get('/api/v1/:sport/odds', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
   const { sport } = req.params;
   const { eventId, books } = req.query;
 
@@ -437,6 +539,12 @@ app.get('/api/v1/:sport/odds', async (req, res) => {
 
 // Moneyline only (h2h market)
 app.get('/api/v1/:sport/moneyline', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
   const { sport } = req.params;
   const { eventId, books } = req.query;
 
@@ -513,6 +621,12 @@ app.get('/api/v1/:sport/moneyline', async (req, res) => {
 
 // Spreads only
 app.get('/api/v1/:sport/spreads', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
   const { sport } = req.params;
   const { eventId, books } = req.query;
 
@@ -589,6 +703,12 @@ app.get('/api/v1/:sport/spreads', async (req, res) => {
 
 // Totals only
 app.get('/api/v1/:sport/totals', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
   const { sport } = req.params;
   const { eventId, books } = req.query;
 
@@ -706,6 +826,17 @@ const mergeBookIntoGames = (gamesMap, bookData, sport) => {
 };
 
 app.get('/api/v1/:sport/props', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
+  // Props require Rookie or MVP tier
+  if (!canAccessProps(auth.tier)) {
+    return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
+  }
+
   const { sport } = req.params;
   const { game_id, player, category } = req.query;
 
@@ -842,6 +973,17 @@ app.get('/api/v1/:sport/props', async (req, res) => {
 
 // Bet365 Props proxy - uses WebSocket cache first, falls back to upstream
 app.get('/api/v1/:sport/props/bet365', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
+  // Props require Rookie or MVP tier
+  if (!canAccessProps(auth.tier)) {
+    return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
+  }
+
   const { sport } = req.params;
   const { game_id, player, category } = req.query;
 
@@ -931,6 +1073,17 @@ app.get('/api/v1/:sport/props/bet365', async (req, res) => {
 
 // Bet365 Props stats endpoint
 app.get('/api/v1/props/bet365/stats', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
+  // Props require Rookie or MVP tier
+  if (!canAccessProps(auth.tier)) {
+    return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
+  }
+
   try {
     const apiBase = getApiBaseUrl();
     const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
@@ -959,6 +1112,17 @@ app.get('/api/v1/props/bet365/stats', async (req, res) => {
 
 // FanDuel Props stats endpoint
 app.get('/api/v1/props/fanduel/stats', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
+  // Props require Rookie or MVP tier
+  if (!canAccessProps(auth.tier)) {
+    return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
+  }
+
   try {
     const apiBase = getApiBaseUrl();
     const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
@@ -987,6 +1151,17 @@ app.get('/api/v1/props/fanduel/stats', async (req, res) => {
 
 // FanDuel Props proxy - uses WebSocket cache first, falls back to upstream
 app.get('/api/v1/:sport/props/fanduel', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
+  // Props require Rookie or MVP tier
+  if (!canAccessProps(auth.tier)) {
+    return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
+  }
+
   const { sport } = req.params;
   const { game_id, player, category } = req.query;
 
@@ -1080,6 +1255,17 @@ app.get('/api/v1/:sport/props/fanduel', async (req, res) => {
 
 // DraftKings Props proxy - uses WebSocket cache first, falls back to upstream
 app.get('/api/v1/:sport/props/draftkings', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
+  // Props require Rookie or MVP tier
+  if (!canAccessProps(auth.tier)) {
+    return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
+  }
+
   const { sport } = req.params;
   const { game_id, player, category } = req.query;
 
@@ -1173,6 +1359,17 @@ app.get('/api/v1/:sport/props/draftkings', async (req, res) => {
 
 // Props history - fetches historical player props from upstream
 app.get('/api/v1/:sport/props/history', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
+  // Props require Rookie or MVP tier
+  if (!canAccessProps(auth.tier)) {
+    return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
+  }
+
   const { sport } = req.params;
   const { game_id, eventId, player, category, prop_type, hours, book } = req.query;
   const resolvedGameId = game_id || eventId;
@@ -1225,6 +1422,17 @@ app.get('/api/v1/:sport/props/history', async (req, res) => {
 // EV proxy - fetches from upstream and caches
 // EV data is included in WebSocket odds broadcasts, so check latestOddsData first
 app.get('/api/v1/:sport/ev', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
+  // EV calculations require Rookie or MVP tier
+  if (!canAccessProps(auth.tier)) {
+    return res.status(403).json({ success: false, error: 'EV calculations require Rookie or MVP subscription' });
+  }
+
   const { sport } = req.params;
   const { eventId, books, min_ev } = req.query;
 
@@ -1266,6 +1474,17 @@ app.get('/api/v1/:sport/ev', async (req, res) => {
 
 // EV History proxy - fetches historical EV data from upstream
 app.get('/api/odds/ev/history', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
+  // EV calculations require Rookie or MVP tier
+  if (!canAccessProps(auth.tier)) {
+    return res.status(403).json({ success: false, error: 'EV calculations require Rookie or MVP subscription' });
+  }
+
   const { eventId, book, market, side, hours } = req.query;
 
   // Validate required params
@@ -1316,6 +1535,17 @@ app.get('/api/odds/ev/history', async (req, res) => {
 
 // Analytics - fetches odds analytics from upstream
 app.get('/api/odds/analytics', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
+  // Analytics require Rookie or MVP tier
+  if (!canAccessProps(auth.tier)) {
+    return res.status(403).json({ success: false, error: 'Analytics require Rookie or MVP subscription' });
+  }
+
   const { eventId, book, market, hours, granularity } = req.query;
 
   try {
@@ -1355,7 +1585,13 @@ app.get('/api/odds/analytics', async (req, res) => {
 // Coverage Report endpoint
 // -----------------------------------------------------------------------------
 
-app.get('/api/v1/coverage', (req, res) => {
+app.get('/api/v1/coverage', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
   const SPORTS = ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'];
 
   // Build odds coverage
@@ -1449,6 +1685,17 @@ app.get('/api/v1/coverage', (req, res) => {
 // Arbitrage proxy - fetches from upstream
 // Arbitrage data is included in WebSocket odds broadcasts
 app.get('/api/v1/:sport/arbitrage', async (req, res) => {
+  // Validate client API key
+  const auth = await validateClientApiKey(req);
+  if (!auth.valid) {
+    return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+
+  // Arbitrage requires Rookie or MVP tier
+  if (!canAccessProps(auth.tier)) {
+    return res.status(403).json({ success: false, error: 'Arbitrage calculations require Rookie or MVP subscription' });
+  }
+
   const { sport } = req.params;
   const { min_profit } = req.query;
 
@@ -2146,8 +2393,15 @@ function broadcastPropsUpdate(data) {
     timestamp: data.timestamp || new Date().toISOString(),
   };
 
-  io.emit('player-props-update', payload);
-  logger.info(`Broadcasted props update to ${io.engine.clientsCount} clients`);
+  // Only broadcast to clients with props access (Rookie/MVP tier)
+  let sentCount = 0;
+  for (const [, socket] of io.sockets.sockets) {
+    if (socket.data.limits?.propsAllowed) {
+      socket.emit('player-props-update', payload);
+      sentCount++;
+    }
+  }
+  logger.info(`Broadcasted props update to ${sentCount}/${io.engine.clientsCount} clients (filtered by tier)`);
 }
 
 // Broadcast Bet365 player props update to all connected clients
@@ -2183,8 +2437,15 @@ function broadcastBet365PropsUpdate(data) {
     timestamp: data.timestamp || new Date().toISOString(),
   };
 
-  io.emit('bet365-props-update', payload);
-  logger.info(`Broadcasted Bet365 props update to ${io.engine.clientsCount} clients`);
+  // Only broadcast to clients with props access (Rookie/MVP tier)
+  let sentCount = 0;
+  for (const [, socket] of io.sockets.sockets) {
+    if (socket.data.limits?.propsAllowed) {
+      socket.emit('bet365-props-update', payload);
+      sentCount++;
+    }
+  }
+  logger.info(`Broadcasted Bet365 props update to ${sentCount}/${io.engine.clientsCount} clients (filtered by tier)`);
 }
 
 // Broadcast FanDuel player props update to all connected clients
@@ -2228,8 +2489,15 @@ function broadcastFanDuelPropsUpdate(data) {
     timestamp: data.timestamp || new Date().toISOString(),
   };
 
-  io.emit('fanduel-props-update', payload);
-  logger.info(`Broadcasted FanDuel props update to ${io.engine.clientsCount} clients`);
+  // Only broadcast to clients with props access (Rookie/MVP tier)
+  let sentCount = 0;
+  for (const [, socket] of io.sockets.sockets) {
+    if (socket.data.limits?.propsAllowed) {
+      socket.emit('fanduel-props-update', payload);
+      sentCount++;
+    }
+  }
+  logger.info(`Broadcasted FanDuel props update to ${sentCount}/${io.engine.clientsCount} clients (filtered by tier)`);
 }
 
 // Broadcast DraftKings player props update to all connected clients
@@ -2265,8 +2533,15 @@ function broadcastDraftKingsPropsUpdate(data) {
     timestamp: data.timestamp || new Date().toISOString(),
   };
 
-  io.emit('draftkings-props-update', payload);
-  logger.info(`Broadcasted DraftKings props update to ${io.engine.clientsCount} clients`);
+  // Only broadcast to clients with props access (Rookie/MVP tier)
+  let sentCount = 0;
+  for (const [, socket] of io.sockets.sockets) {
+    if (socket.data.limits?.propsAllowed) {
+      socket.emit('draftkings-props-update', payload);
+      sentCount++;
+    }
+  }
+  logger.info(`Broadcasted DraftKings props update to ${sentCount}/${io.engine.clientsCount} clients (filtered by tier)`);
 }
 
 // Forward props history responses to the requesting client (by requestId)
@@ -2325,8 +2600,15 @@ function broadcastBetMGMPropsUpdate(data) {
     timestamp: data.timestamp || new Date().toISOString(),
   };
 
-  io.emit('betmgm-props-update', payload);
-  logger.info(`Broadcasted BetMGM props update to ${io.engine.clientsCount} clients`);
+  // Only broadcast to clients with props access (Rookie/MVP tier)
+  let sentCount = 0;
+  for (const [, socket] of io.sockets.sockets) {
+    if (socket.data.limits?.propsAllowed) {
+      socket.emit('betmgm-props-update', payload);
+      sentCount++;
+    }
+  }
+  logger.info(`Broadcasted BetMGM props update to ${sentCount}/${io.engine.clientsCount} clients (filtered by tier)`);
 }
 
 // Broadcast Caesars player props update to all connected clients
@@ -2362,8 +2644,15 @@ function broadcastCaesarsPropsUpdate(data) {
     timestamp: data.timestamp || new Date().toISOString(),
   };
 
-  io.emit('caesars-props-update', payload);
-  logger.info(`Broadcasted Caesars props update to ${io.engine.clientsCount} clients`);
+  // Only broadcast to clients with props access (Rookie/MVP tier)
+  let sentCount = 0;
+  for (const [, socket] of io.sockets.sockets) {
+    if (socket.data.limits?.propsAllowed) {
+      socket.emit('caesars-props-update', payload);
+      sentCount++;
+    }
+  }
+  logger.info(`Broadcasted Caesars props update to ${sentCount}/${io.engine.clientsCount} clients (filtered by tier)`);
 }
 
 // -----------------------------------------------------------------------------
@@ -2417,9 +2706,73 @@ async function debugProbeHistory(latestSports) {
   }
 }
 
+// -----------------------------------------------------------------------------
+// Socket.io Authentication Middleware
+// -----------------------------------------------------------------------------
+io.use(async (socket, next) => {
+  // Extract API key from query params, auth object, or headers
+  const apiKey = socket.handshake.query?.apiKey
+    || socket.handshake.auth?.apiKey
+    || extractApiKey(socket.handshake.headers?.authorization);
+
+  if (!apiKey) {
+    logger.warn(`WebSocket connection rejected: no API key provided`);
+    return next(new Error('API key required'));
+  }
+
+  // Call upstream to validate the key
+  const apiBase = getApiBaseUrl();
+  const proxyApiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+
+  if (!apiBase || !proxyApiKey) {
+    logger.error('WebSocket auth failed: proxy not configured');
+    return next(new Error('Authentication service unavailable'));
+  }
+
+  try {
+    const resp = await fetch(`${apiBase}/api/internal/validate-key`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${proxyApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ apiKey }),
+    });
+
+    if (!resp.ok) {
+      logger.warn(`WebSocket auth failed: upstream returned ${resp.status}`);
+      return next(new Error('Authentication failed'));
+    }
+
+    const validation = await resp.json();
+
+    if (!validation.valid) {
+      logger.warn(`WebSocket connection rejected: ${validation.error}`);
+      return next(new Error(validation.error || 'Invalid API key'));
+    }
+
+    // Check if WebSocket is enabled for this tier
+    if (!validation.limits?.websocketEnabled) {
+      logger.warn(`WebSocket connection rejected: tier ${validation.tier} does not have WebSocket access`);
+      return next(new Error('WebSocket requires Rookie or MVP subscription'));
+    }
+
+    // Attach auth info to socket for tier-based filtering
+    socket.data.userId = validation.userId;
+    socket.data.tier = validation.tier;
+    socket.data.limits = validation.limits;
+
+    logger.info(`WebSocket authenticated: userId=${validation.userId}, tier=${validation.tier}`);
+    next();
+  } catch (err) {
+    logger.error(`WebSocket auth error: ${err.message}`);
+    return next(new Error('Authentication failed'));
+  }
+});
+
 // Handle downstream client connections (Owls Insight frontend)
 io.on('connection', (socket) => {
-  logger.info(`Client connected: ${socket.id} (Total: ${io.engine.clientsCount})`);
+  logger.info(`Client connected: ${socket.id} (userId=${socket.data.userId}, tier=${socket.data.tier}, Total: ${io.engine.clientsCount})`);
   logger.debug(`[Downstream] socket connected. query=${JSON.stringify(socket.handshake.query || {})}`);
 
   // Client wants live history updates for a drawer
@@ -2554,6 +2907,11 @@ io.on('connection', (socket) => {
   // Handle manual props refresh request from client
   socket.on('request-props', () => {
     logger.debug(`Client ${socket.id} requested props refresh`);
+    // Only send props to clients with props access
+    if (!socket.data.limits?.propsAllowed) {
+      logger.debug(`Client ${socket.id} denied props refresh (tier: ${socket.data.tier})`);
+      return;
+    }
     if (latestPropsData) {
       logger.debug(`[Downstream] re-sending cached props to ${socket.id}`);
       socket.emit('player-props-update', {
@@ -2566,6 +2924,11 @@ io.on('connection', (socket) => {
   // Handle manual Bet365 props refresh request from client
   socket.on('request-bet365-props', () => {
     logger.debug(`Client ${socket.id} requested Bet365 props refresh`);
+    // Only send props to clients with props access
+    if (!socket.data.limits?.propsAllowed) {
+      logger.debug(`Client ${socket.id} denied Bet365 props refresh (tier: ${socket.data.tier})`);
+      return;
+    }
     if (latestBet365PropsData) {
       logger.debug(`[Downstream] re-sending cached Bet365 props to ${socket.id}`);
       socket.emit('bet365-props-update', {
@@ -2578,6 +2941,11 @@ io.on('connection', (socket) => {
   // Handle manual FanDuel props refresh request from client
   socket.on('request-fanduel-props', () => {
     logger.debug(`Client ${socket.id} requested FanDuel props refresh`);
+    // Only send props to clients with props access
+    if (!socket.data.limits?.propsAllowed) {
+      logger.debug(`Client ${socket.id} denied FanDuel props refresh (tier: ${socket.data.tier})`);
+      return;
+    }
     if (latestFanDuelPropsData) {
       logger.debug(`[Downstream] re-sending cached FanDuel props to ${socket.id}`);
       socket.emit('fanduel-props-update', {
@@ -2590,6 +2958,11 @@ io.on('connection', (socket) => {
   // Handle manual DraftKings props refresh request from client
   socket.on('request-draftkings-props', () => {
     logger.debug(`Client ${socket.id} requested DraftKings props refresh`);
+    // Only send props to clients with props access
+    if (!socket.data.limits?.propsAllowed) {
+      logger.debug(`Client ${socket.id} denied DraftKings props refresh (tier: ${socket.data.tier})`);
+      return;
+    }
     if (latestDraftKingsPropsData) {
       logger.debug(`[Downstream] re-sending cached DraftKings props to ${socket.id}`);
       socket.emit('draftkings-props-update', {
@@ -2602,6 +2975,17 @@ io.on('connection', (socket) => {
   // Handle props history request from client (forward upstream)
   socket.on('request-props-history', (payload) => {
     const requestId = payload?.requestId || `props-history-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // Only allow props history for clients with props access
+    if (!socket.data.limits?.propsAllowed) {
+      socket.emit('props-history-response', {
+        success: false,
+        requestId,
+        error: 'Props history requires Rookie or MVP subscription',
+      });
+      return;
+    }
+
     const gameId = payload?.gameId || payload?.game_id || payload?.eventId;
     const player = payload?.player;
     const category = payload?.category;
@@ -2669,6 +3053,11 @@ io.on('connection', (socket) => {
   // Handle manual BetMGM props refresh request from client
   socket.on('request-betmgm-props', () => {
     logger.debug(`Client ${socket.id} requested BetMGM props refresh`);
+    // Only send props to clients with props access
+    if (!socket.data.limits?.propsAllowed) {
+      logger.debug(`Client ${socket.id} denied BetMGM props refresh (tier: ${socket.data.tier})`);
+      return;
+    }
     if (latestBetMGMPropsData) {
       logger.debug(`[Downstream] re-sending cached BetMGM props to ${socket.id}`);
       socket.emit('betmgm-props-update', {
@@ -2681,6 +3070,11 @@ io.on('connection', (socket) => {
   // Handle manual Caesars props refresh request from client
   socket.on('request-caesars-props', () => {
     logger.debug(`Client ${socket.id} requested Caesars props refresh`);
+    // Only send props to clients with props access
+    if (!socket.data.limits?.propsAllowed) {
+      logger.debug(`Client ${socket.id} denied Caesars props refresh (tier: ${socket.data.tier})`);
+      return;
+    }
     if (latestCaesarsPropsData) {
       logger.debug(`[Downstream] re-sending cached Caesars props to ${socket.id}`);
       socket.emit('caesars-props-update', {
