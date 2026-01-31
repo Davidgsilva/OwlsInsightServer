@@ -16,8 +16,58 @@ app.use(cors({ origin: CORS_ORIGIN }));
 app.use(express.json());
 
 // -----------------------------------------------------------------------------
-// API Key Authentication Helpers
+// Tier Configuration (mirrors nba-odds-app TIER_LIMITS)
 // -----------------------------------------------------------------------------
+
+const TIER_LIMITS = {
+  bench: {
+    requestsPerMonth: 10_000,
+    requestsPerMinute: 20,
+    concurrentRequests: 1,
+    websocketEnabled: false,
+    websocketConnections: 0,
+    websocketEventsPerMinute: 0,
+    propsAllowed: false,
+    historyDays: 0,
+    dataDelaySeconds: 45, // Bench gets 45-second delayed data
+  },
+  rookie: {
+    requestsPerMonth: 75_000,
+    requestsPerMinute: 120,
+    concurrentRequests: 5,
+    websocketEnabled: true,
+    websocketConnections: 2,
+    websocketEventsPerMinute: 100,
+    propsAllowed: true,
+    historyDays: 14,
+    dataDelaySeconds: 0, // Real-time
+  },
+  mvp: {
+    requestsPerMonth: 300_000,
+    requestsPerMinute: 400,
+    concurrentRequests: 15,
+    websocketEnabled: true,
+    websocketConnections: 5,
+    websocketEventsPerMinute: -1, // Unlimited
+    propsAllowed: true,
+    historyDays: 90,
+    dataDelaySeconds: 0, // Real-time
+  },
+};
+
+// -----------------------------------------------------------------------------
+// API Key Authentication & Caching
+// -----------------------------------------------------------------------------
+
+// Validation cache to avoid hitting upstream on every request
+const validationCache = new Map();
+const VALIDATION_CACHE_TTL_MS = 60_000; // 1 minute
+
+// Rate limiting: track requests per API key per minute
+const rateLimitBuckets = new Map(); // apiKey -> { count, windowStart }
+
+// WebSocket connection tracking per user
+const wsConnectionsByUser = new Map(); // userId -> Set<socketId>
 
 /**
  * Extract API key from Authorization header
@@ -30,13 +80,19 @@ function extractApiKey(authHeader) {
 
 /**
  * Authentication middleware - validates client API key via upstream
- * Returns validation result with tier and limits info
+ * Includes caching to avoid upstream calls on every request
  */
 async function validateClientApiKey(req) {
   const clientApiKey = extractApiKey(req.headers.authorization);
 
   if (!clientApiKey) {
     return { valid: false, status: 401, error: 'API key required' };
+  }
+
+  // Check cache first
+  const cached = validationCache.get(clientApiKey);
+  if (cached && Date.now() - cached.timestamp < VALIDATION_CACHE_TTL_MS) {
+    return cached.result;
   }
 
   // Call upstream to validate the key
@@ -48,6 +104,9 @@ async function validateClientApiKey(req) {
   }
 
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
     const resp = await fetch(`${apiBase}/api/internal/validate-key`, {
       method: 'POST',
       headers: {
@@ -55,36 +114,213 @@ async function validateClientApiKey(req) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ apiKey: clientApiKey }),
+      signal: controller.signal,
     });
 
+    clearTimeout(timeout);
+
     if (!resp.ok) {
-      return { valid: false, status: resp.status, error: 'Authentication failed' };
+      const result = { valid: false, status: resp.status, error: 'Authentication failed' };
+      // Cache negative results for shorter time
+      validationCache.set(clientApiKey, { result, timestamp: Date.now() - VALIDATION_CACHE_TTL_MS + 10_000 });
+      return result;
     }
 
     const validation = await resp.json();
 
     if (!validation.valid) {
-      return { valid: false, status: 401, error: validation.error || 'Invalid API key' };
+      const result = { valid: false, status: 401, error: validation.error || 'Invalid API key' };
+      validationCache.set(clientApiKey, { result, timestamp: Date.now() - VALIDATION_CACHE_TTL_MS + 10_000 });
+      return result;
     }
 
-    return {
+    // Merge upstream limits with our tier config (upstream is source of truth for tier)
+    const tierConfig = TIER_LIMITS[validation.tier] || TIER_LIMITS.bench;
+
+    const result = {
       valid: true,
       userId: validation.userId,
       tier: validation.tier,
-      limits: validation.limits,
+      limits: {
+        ...tierConfig,
+        ...validation.limits, // Upstream can override if needed
+        propsAllowed: tierConfig.propsAllowed,
+        dataDelaySeconds: tierConfig.dataDelaySeconds,
+      },
       clientApiKey,
     };
+
+    // Cache successful validation
+    validationCache.set(clientApiKey, { result, timestamp: Date.now() });
+    return result;
   } catch (err) {
+    if (err.name === 'AbortError') {
+      logger.error('API key validation timeout');
+      return { valid: false, status: 504, error: 'Authentication service timeout' };
+    }
     logger.error(`API key validation error: ${err.message}`);
     return { valid: false, status: 500, error: 'Authentication service unavailable' };
   }
 }
 
 /**
+ * Check rate limit for an API key
+ * Returns { allowed: boolean, remaining: number, resetIn: number }
+ */
+function checkRateLimit(apiKey, tier) {
+  const limits = TIER_LIMITS[tier] || TIER_LIMITS.bench;
+  const maxPerMinute = limits.requestsPerMinute;
+
+  const now = Date.now();
+  const windowStart = Math.floor(now / 60_000) * 60_000; // Current minute window
+
+  let bucket = rateLimitBuckets.get(apiKey);
+  if (!bucket || bucket.windowStart !== windowStart) {
+    bucket = { count: 0, windowStart };
+    rateLimitBuckets.set(apiKey, bucket);
+  }
+
+  if (bucket.count >= maxPerMinute) {
+    const resetIn = 60_000 - (now - windowStart);
+    return {
+      allowed: false,
+      remaining: 0,
+      resetIn,
+      limit: maxPerMinute,
+    };
+  }
+
+  bucket.count++;
+  return {
+    allowed: true,
+    remaining: maxPerMinute - bucket.count,
+    resetIn: 60_000 - (now - windowStart),
+    limit: maxPerMinute,
+  };
+}
+
+/**
  * Check if the tier is allowed to access props endpoints
  */
 function canAccessProps(tier) {
-  return tier === 'rookie' || tier === 'mvp';
+  const limits = TIER_LIMITS[tier];
+  return limits?.propsAllowed === true;
+}
+
+/**
+ * Get data delay for a tier (in seconds)
+ */
+function getDataDelay(tier) {
+  const limits = TIER_LIMITS[tier];
+  return limits?.dataDelaySeconds || 0;
+}
+
+/**
+ * Track WebSocket connection for a user
+ * Returns true if connection allowed, false if limit reached
+ */
+function trackWsConnection(userId, socketId, tier) {
+  const limits = TIER_LIMITS[tier] || TIER_LIMITS.bench;
+  const maxConnections = limits.websocketConnections;
+
+  if (!wsConnectionsByUser.has(userId)) {
+    wsConnectionsByUser.set(userId, new Set());
+  }
+
+  const userConnections = wsConnectionsByUser.get(userId);
+
+  // Check if already tracked (reconnection)
+  if (userConnections.has(socketId)) {
+    return true;
+  }
+
+  // Check limit
+  if (userConnections.size >= maxConnections) {
+    return false;
+  }
+
+  userConnections.add(socketId);
+  return true;
+}
+
+/**
+ * Remove WebSocket connection tracking for a socket
+ */
+function untrackWsConnection(userId, socketId) {
+  const userConnections = wsConnectionsByUser.get(userId);
+  if (userConnections) {
+    userConnections.delete(socketId);
+    if (userConnections.size === 0) {
+      wsConnectionsByUser.delete(userId);
+    }
+  }
+}
+
+// Clean up stale rate limit buckets every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  const currentWindow = Math.floor(now / 60_000) * 60_000;
+  for (const [key, bucket] of rateLimitBuckets) {
+    if (bucket.windowStart < currentWindow - 60_000) {
+      rateLimitBuckets.delete(key);
+    }
+  }
+}, 5 * 60_000).unref();
+
+// Clean up stale validation cache every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, cached] of validationCache) {
+    if (now - cached.timestamp > VALIDATION_CACHE_TTL_MS * 2) {
+      validationCache.delete(key);
+    }
+  }
+}, 5 * 60_000).unref();
+
+/**
+ * Combined auth + rate limit check for REST endpoints
+ * Returns auth result with rate limit headers to set
+ */
+async function authenticateAndRateLimit(req, res) {
+  const auth = await validateClientApiKey(req);
+
+  if (!auth.valid) {
+    return { auth, rateLimited: false };
+  }
+
+  // Check rate limit
+  const rateLimit = checkRateLimit(auth.clientApiKey, auth.tier);
+
+  // Set rate limit headers
+  res.set('X-RateLimit-Limit', rateLimit.limit);
+  res.set('X-RateLimit-Remaining', rateLimit.remaining);
+  res.set('X-RateLimit-Reset', Math.ceil((Date.now() + rateLimit.resetIn) / 1000));
+
+  if (!rateLimit.allowed) {
+    return {
+      auth,
+      rateLimited: true,
+      retryAfter: Math.ceil(rateLimit.resetIn / 1000),
+    };
+  }
+
+  return { auth, rateLimited: false };
+}
+
+/**
+ * Apply data delay for Bench tier
+ * Returns filtered data that's at least dataDelaySeconds old
+ * For now, this is a placeholder - full implementation would require
+ * timestamped snapshots. Currently just returns the data as-is with a note.
+ */
+function applyDataDelay(data, tier) {
+  const delay = getDataDelay(tier);
+  if (delay === 0) {
+    return { data, delayed: false };
+  }
+  // TODO: Implement proper delay using historical snapshots
+  // For now, return data with a flag indicating it should be delayed
+  return { data, delayed: true, delaySeconds: delay };
 }
 
 // -----------------------------------------------------------------------------
@@ -258,10 +494,14 @@ function clearSocketWatchers(socketId) {
 }
 
 app.get('/api/history', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   const { eventId, book, market, hours } = req.query;
@@ -281,10 +521,14 @@ app.get('/api/history', async (req, res) => {
 // Single-side history endpoint - proxies to upstream API server
 // This matches the nba-odds-app /api/odds/history endpoint format
 app.get('/api/odds/history', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   const { eventId, book, market, side, hours } = req.query;
@@ -383,10 +627,14 @@ async function fetchLiveScoresFromUpstream(sport = null) {
 
 // All sports live scores
 app.get('/api/v1/scores/live', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   try {
@@ -411,10 +659,14 @@ app.get('/api/v1/scores/live', async (req, res) => {
 // Sport-specific live scores
 const VALID_SPORTS = ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'];
 app.get('/api/v1/:sport/scores/live', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   const { sport } = req.params;
@@ -461,10 +713,14 @@ function filterBookmakerMarkets(bookmakers, marketKey) {
 
 // All odds for a sport (from WebSocket cache)
 app.get('/api/v1/:sport/odds', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   const { sport } = req.params;
@@ -539,10 +795,14 @@ app.get('/api/v1/:sport/odds', async (req, res) => {
 
 // Moneyline only (h2h market)
 app.get('/api/v1/:sport/moneyline', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   const { sport } = req.params;
@@ -621,10 +881,14 @@ app.get('/api/v1/:sport/moneyline', async (req, res) => {
 
 // Spreads only
 app.get('/api/v1/:sport/spreads', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   const { sport } = req.params;
@@ -703,10 +967,14 @@ app.get('/api/v1/:sport/spreads', async (req, res) => {
 
 // Totals only
 app.get('/api/v1/:sport/totals', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   const { sport } = req.params;
@@ -826,10 +1094,14 @@ const mergeBookIntoGames = (gamesMap, bookData, sport) => {
 };
 
 app.get('/api/v1/:sport/props', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   // Props require Rookie or MVP tier
@@ -973,10 +1245,14 @@ app.get('/api/v1/:sport/props', async (req, res) => {
 
 // Bet365 Props proxy - uses WebSocket cache first, falls back to upstream
 app.get('/api/v1/:sport/props/bet365', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   // Props require Rookie or MVP tier
@@ -1073,10 +1349,14 @@ app.get('/api/v1/:sport/props/bet365', async (req, res) => {
 
 // Bet365 Props stats endpoint
 app.get('/api/v1/props/bet365/stats', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   // Props require Rookie or MVP tier
@@ -1112,10 +1392,14 @@ app.get('/api/v1/props/bet365/stats', async (req, res) => {
 
 // FanDuel Props stats endpoint
 app.get('/api/v1/props/fanduel/stats', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   // Props require Rookie or MVP tier
@@ -1151,10 +1435,14 @@ app.get('/api/v1/props/fanduel/stats', async (req, res) => {
 
 // FanDuel Props proxy - uses WebSocket cache first, falls back to upstream
 app.get('/api/v1/:sport/props/fanduel', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   // Props require Rookie or MVP tier
@@ -1255,10 +1543,14 @@ app.get('/api/v1/:sport/props/fanduel', async (req, res) => {
 
 // DraftKings Props proxy - uses WebSocket cache first, falls back to upstream
 app.get('/api/v1/:sport/props/draftkings', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   // Props require Rookie or MVP tier
@@ -1359,10 +1651,14 @@ app.get('/api/v1/:sport/props/draftkings', async (req, res) => {
 
 // Props history - fetches historical player props from upstream
 app.get('/api/v1/:sport/props/history', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   // Props require Rookie or MVP tier
@@ -1422,10 +1718,14 @@ app.get('/api/v1/:sport/props/history', async (req, res) => {
 // EV proxy - fetches from upstream and caches
 // EV data is included in WebSocket odds broadcasts, so check latestOddsData first
 app.get('/api/v1/:sport/ev', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   // EV calculations require Rookie or MVP tier
@@ -1474,10 +1774,14 @@ app.get('/api/v1/:sport/ev', async (req, res) => {
 
 // EV History proxy - fetches historical EV data from upstream
 app.get('/api/odds/ev/history', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   // EV calculations require Rookie or MVP tier
@@ -1535,10 +1839,14 @@ app.get('/api/odds/ev/history', async (req, res) => {
 
 // Analytics - fetches odds analytics from upstream
 app.get('/api/odds/analytics', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   // Analytics require Rookie or MVP tier
@@ -1586,10 +1894,14 @@ app.get('/api/odds/analytics', async (req, res) => {
 // -----------------------------------------------------------------------------
 
 app.get('/api/v1/coverage', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   const SPORTS = ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'];
@@ -1685,10 +1997,14 @@ app.get('/api/v1/coverage', async (req, res) => {
 // Arbitrage proxy - fetches from upstream
 // Arbitrage data is included in WebSocket odds broadcasts
 app.get('/api/v1/:sport/arbitrage', async (req, res) => {
-  // Validate client API key
-  const auth = await validateClientApiKey(req);
+  // Validate client API key and check rate limit
+  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
+  }
+  if (rateLimited) {
+    res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
   }
 
   // Arbitrage requires Rookie or MVP tier
@@ -2757,12 +3073,21 @@ io.use(async (socket, next) => {
       return next(new Error('WebSocket requires Rookie or MVP subscription'));
     }
 
+    // Check connection limit
+    const canConnect = trackWsConnection(validation.userId, socket.id, validation.tier);
+    if (!canConnect) {
+      const maxConns = TIER_LIMITS[validation.tier]?.websocketConnections || 0;
+      logger.warn(`WebSocket connection rejected: userId=${validation.userId} exceeded limit of ${maxConns} connections`);
+      return next(new Error(`Connection limit reached. ${validation.tier} tier allows ${maxConns} concurrent WebSocket connections.`));
+    }
+
     // Attach auth info to socket for tier-based filtering
     socket.data.userId = validation.userId;
     socket.data.tier = validation.tier;
     socket.data.limits = validation.limits;
+    socket.data.apiKey = apiKey; // Store for disconnect cleanup
 
-    logger.info(`WebSocket authenticated: userId=${validation.userId}, tier=${validation.tier}`);
+    logger.info(`WebSocket authenticated: userId=${validation.userId}, tier=${validation.tier}, connections=${wsConnectionsByUser.get(validation.userId)?.size || 1}`);
     next();
   } catch (err) {
     logger.error(`WebSocket auth error: ${err.message}`);
@@ -3091,7 +3416,14 @@ io.on('connection', (socket) => {
       if (value.socketId === socket.id) propsHistoryRequests.delete(key);
     });
     propsHistoryRateLimits.delete(socket.id);
-    logger.info(`Client disconnected: ${socket.id} (Reason: ${reason}, Remaining: ${io.engine.clientsCount})`);
+
+    // Untrack WebSocket connection for limit enforcement
+    if (socket.data.userId) {
+      untrackWsConnection(socket.data.userId, socket.id);
+      logger.info(`Client disconnected: ${socket.id} (userId=${socket.data.userId}, tier=${socket.data.tier}, Reason: ${reason}, Remaining: ${io.engine.clientsCount})`);
+    } else {
+      logger.info(`Client disconnected: ${socket.id} (Reason: ${reason}, Remaining: ${io.engine.clientsCount})`);
+    }
   });
 });
 
