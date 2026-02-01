@@ -133,8 +133,11 @@ Valid sports for REST endpoints: `nba`, `ncaab`, `nfl`, `nhl`, `ncaaf`
 ### Environment Variables
 
 Required:
-- `UPSTREAM_WS_URL` - WebSocket URL of upstream odds provider
-- `OWLS_INSIGHT_SERVER_API_KEY` - API key for upstream authentication
+- `UPSTREAM_WS_URL` - WebSocket URL of upstream odds provider (e.g., `http://owls-insight-api-server`)
+- `OWLS_INSIGHT_SERVER_API_KEY` - Proxy's API key for upstream authentication. This key:
+  - Must be generated from nba-odds-app and have MVP tier
+  - Is used by proxy to authenticate to upstream `/api/internal/validate-key`
+  - Is NOT the same as client API keys (clients have their own keys)
 
 Optional:
 - `PORT` (default: 3002) - Server port
@@ -147,6 +150,112 @@ Optional:
 - `UPSTREAM_RECONNECT_DELAY` (default: 5000) - Delay between reconnects in ms
 - `OWLS_INSIGHT_API_BASE_URL` - Override base URL for history API (derived from `UPSTREAM_WS_URL` if not set)
 - `DEBUG_OWLS_INSIGHT` (default: false) - Set to `true` for verbose debug logging of data flow
+
+## API Key Authentication & Rate Limiting
+
+All REST endpoints and WebSocket connections require a valid API key (except `/health` and `/internal/connections`).
+
+### Authentication Flow
+
+```
+Client Request (with API key)
+    │
+    ▼
+OwlsInsightServer (this proxy)
+    │
+    ├─► Check validation cache (1-min TTL)
+    │   └─► Cache hit? Return cached result
+    │
+    ├─► Check circuit breaker
+    │   └─► Open? Return 503 (fail fast)
+    │
+    ├─► Check IP rate limit (brute force protection)
+    │   └─► Too many failures? Return 429
+    │
+    └─► Call upstream /api/internal/validate-key
+        │
+        ▼
+    nba-odds-app validates key against MySQL
+        │
+        ▼
+    Return tier + limits to proxy
+```
+
+### Rate Limits by Tier
+
+| Limit | Bench ($9.99) | Rookie ($24.99) | MVP ($49.99) |
+|-------|---------------|-----------------|--------------|
+| **Requests/Month** | 10,000 | 75,000 | 300,000 |
+| **Requests/Minute** | 20 | 120 | 400 |
+| **WebSocket Enabled** | No | Yes | Yes |
+| **WebSocket Connections** | 0 | 2 | 5 |
+| **Props Access** | No | Yes | Yes |
+| **History Days** | 0 | 14 | 90 |
+| **Data Delay** | 45 seconds* | Real-time | Real-time |
+
+*Data delay not yet implemented - all tiers get real-time data currently.
+
+### Rate Limit Headers
+
+All authenticated responses include:
+- `X-RateLimit-Limit` - Requests allowed per minute
+- `X-RateLimit-Remaining` - Requests remaining in current window
+- `X-RateLimit-Reset` - Unix timestamp when window resets
+
+### Circuit Breaker
+
+Protects against upstream failures:
+- Opens after 5 consecutive failures
+- Returns 503 immediately when open (fail fast)
+- Half-open state after 30 seconds (tries one request)
+- Closes on successful upstream response
+
+### IP Rate Limiting
+
+Prevents brute force attacks:
+- Max 10 failed auth attempts per IP per minute
+- Returns 429 with `Retry-After` header when exceeded
+- Resets on successful authentication
+
+### Feature Access by Tier
+
+| Feature | Bench | Rookie | MVP |
+|---------|-------|--------|-----|
+| Odds (h2h, spreads, totals) | ✓ | ✓ | ✓ |
+| Live Scores | ✓ | ✓ | ✓ |
+| Player Props | ✗ | ✓ | ✓ |
+| EV Calculations | ✗ | ✓ | ✓ |
+| Arbitrage | ✗ | ✓ | ✓ |
+| Historical Data | ✗ | ✓ | ✓ |
+| WebSocket | ✗ | ✓ | ✓ |
+| Props via WebSocket | ✗ | ✓ | ✓ |
+
+### Client Authentication
+
+**REST API:**
+```bash
+curl -H "Authorization: Bearer YOUR_API_KEY" https://ws.owlsinsight.com/api/v1/nba/odds
+```
+
+**WebSocket:**
+```javascript
+// Option 1: Query parameter
+const socket = io('wss://ws.owlsinsight.com', { query: { apiKey: 'YOUR_API_KEY' } });
+
+// Option 2: Auth object
+const socket = io('wss://ws.owlsinsight.com', { auth: { apiKey: 'YOUR_API_KEY' } });
+
+// Option 3: Headers (if supported by client)
+const socket = io('wss://ws.owlsinsight.com', {
+  extraHeaders: { Authorization: 'Bearer YOUR_API_KEY' }
+});
+```
+
+### Known Limitations
+
+1. **Monthly limits not enforced** - Only per-minute rate limiting is active
+2. **Concurrent request limits not enforced** - Defined but not tracked
+3. **Data delay not implemented** - Bench tier gets real-time data (should be 45s delayed)
 
 ## Multi-Repo Architecture
 

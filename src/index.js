@@ -3140,8 +3140,12 @@ io.use(async (socket, next) => {
     return next(new Error('API key required'));
   }
 
-  // Use the same cached validation as REST endpoints (includes timeout)
-  const mockReq = { headers: { authorization: `Bearer ${apiKey}` } };
+  // Use the same cached validation as REST endpoints (includes timeout + IP rate limiting)
+  const clientIP = socket.handshake.headers?.['x-forwarded-for']?.split(',')[0] || socket.handshake.address;
+  const mockReq = {
+    headers: { authorization: `Bearer ${apiKey}` },
+    ip: clientIP,
+  };
   const auth = await validateClientApiKey(mockReq);
 
   if (!auth.valid) {
