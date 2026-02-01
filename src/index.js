@@ -63,8 +63,20 @@ const TIER_LIMITS = {
 const validationCache = new Map();
 const VALIDATION_CACHE_TTL_MS = 60_000; // 1 minute
 
+// Circuit breaker for upstream auth service
+let circuitOpen = false;
+let circuitOpenTime = 0;
+let consecutiveFailures = 0;
+const CIRCUIT_FAILURE_THRESHOLD = 5; // Open circuit after 5 consecutive failures
+const CIRCUIT_RESET_TIMEOUT_MS = 30_000; // Try again after 30 seconds
+
 // Rate limiting: track requests per API key per minute
 const rateLimitBuckets = new Map(); // apiKey -> { count, windowStart }
+
+// Failed auth rate limiting by IP (prevent brute force)
+const failedAuthByIP = new Map(); // ip -> { count, firstFailure }
+const FAILED_AUTH_WINDOW_MS = 60_000; // 1 minute window
+const FAILED_AUTH_MAX_ATTEMPTS = 10; // Max failures per IP per minute
 
 // WebSocket connection tracking per user
 const wsConnectionsByUser = new Map(); // userId -> Set<socketId>
@@ -79,20 +91,82 @@ function extractApiKey(authHeader) {
 }
 
 /**
+ * Check if IP is rate limited due to failed auth attempts
+ */
+function checkFailedAuthRateLimit(ip) {
+  if (!ip) return { allowed: true };
+
+  const record = failedAuthByIP.get(ip);
+  if (!record) return { allowed: true };
+
+  // Reset if window expired
+  if (Date.now() - record.firstFailure > FAILED_AUTH_WINDOW_MS) {
+    failedAuthByIP.delete(ip);
+    return { allowed: true };
+  }
+
+  if (record.count >= FAILED_AUTH_MAX_ATTEMPTS) {
+    const retryAfter = Math.ceil((FAILED_AUTH_WINDOW_MS - (Date.now() - record.firstFailure)) / 1000);
+    return { allowed: false, retryAfter };
+  }
+
+  return { allowed: true };
+}
+
+/**
+ * Track a failed auth attempt for an IP
+ */
+function trackFailedAuth(ip) {
+  if (!ip) return;
+
+  const record = failedAuthByIP.get(ip);
+  if (!record || Date.now() - record.firstFailure > FAILED_AUTH_WINDOW_MS) {
+    failedAuthByIP.set(ip, { count: 1, firstFailure: Date.now() });
+  } else {
+    record.count++;
+  }
+}
+
+/**
+ * Clear failed auth tracking for an IP (on successful auth)
+ */
+function clearFailedAuth(ip) {
+  if (ip) failedAuthByIP.delete(ip);
+}
+
+/**
  * Authentication middleware - validates client API key via upstream
- * Includes caching to avoid upstream calls on every request
+ * Includes caching, circuit breaker, and IP rate limiting
  */
 async function validateClientApiKey(req) {
   const clientApiKey = extractApiKey(req.headers.authorization);
+  const clientIP = req.ip || req.connection?.remoteAddress || req.headers?.['x-forwarded-for']?.split(',')[0];
 
   if (!clientApiKey) {
     return { valid: false, status: 401, error: 'API key required' };
   }
 
-  // Check cache first
+  // Check if IP is rate limited due to too many failed attempts
+  const ipCheck = checkFailedAuthRateLimit(clientIP);
+  if (!ipCheck.allowed) {
+    logger.warn(`IP ${clientIP} rate limited due to failed auth attempts`);
+    return { valid: false, status: 429, error: 'Too many failed authentication attempts', retryAfter: ipCheck.retryAfter };
+  }
+
+  // Check cache first (works even when circuit is open)
   const cached = validationCache.get(clientApiKey);
   if (cached && Date.now() - cached.timestamp < VALIDATION_CACHE_TTL_MS) {
     return cached.result;
+  }
+
+  // Check circuit breaker - if open, fail fast
+  if (circuitOpen) {
+    if (Date.now() - circuitOpenTime < CIRCUIT_RESET_TIMEOUT_MS) {
+      logger.debug('Circuit breaker open, failing fast');
+      return { valid: false, status: 503, error: 'Authentication service temporarily unavailable' };
+    }
+    // Try to close circuit (half-open state)
+    logger.info('Circuit breaker half-open, attempting upstream call');
   }
 
   // Call upstream to validate the key
@@ -119,7 +193,15 @@ async function validateClientApiKey(req) {
 
     clearTimeout(timeout);
 
+    // Success - reset circuit breaker
+    if (circuitOpen) {
+      logger.info('Circuit breaker closed - upstream recovered');
+    }
+    circuitOpen = false;
+    consecutiveFailures = 0;
+
     if (!resp.ok) {
+      trackFailedAuth(clientIP);
       const result = { valid: false, status: resp.status, error: 'Authentication failed' };
       // Cache negative results for shorter time
       validationCache.set(clientApiKey, { result, timestamp: Date.now() - VALIDATION_CACHE_TTL_MS + 10_000 });
@@ -129,10 +211,14 @@ async function validateClientApiKey(req) {
     const validation = await resp.json();
 
     if (!validation.valid) {
+      trackFailedAuth(clientIP);
       const result = { valid: false, status: 401, error: validation.error || 'Invalid API key' };
       validationCache.set(clientApiKey, { result, timestamp: Date.now() - VALIDATION_CACHE_TTL_MS + 10_000 });
       return result;
     }
+
+    // Success - clear failed auth tracking for this IP
+    clearFailedAuth(clientIP);
 
     // Merge upstream limits with our tier config (upstream is source of truth for tier)
     const tierConfig = TIER_LIMITS[validation.tier] || TIER_LIMITS.bench;
@@ -154,12 +240,20 @@ async function validateClientApiKey(req) {
     validationCache.set(clientApiKey, { result, timestamp: Date.now() });
     return result;
   } catch (err) {
+    // Track failures for circuit breaker
+    consecutiveFailures++;
+    if (consecutiveFailures >= CIRCUIT_FAILURE_THRESHOLD && !circuitOpen) {
+      circuitOpen = true;
+      circuitOpenTime = Date.now();
+      logger.error(`Circuit breaker opened after ${consecutiveFailures} consecutive failures`);
+    }
+
     if (err.name === 'AbortError') {
       logger.error('API key validation timeout');
       return { valid: false, status: 504, error: 'Authentication service timeout' };
     }
     logger.error(`API key validation error: ${err.message}`);
-    return { valid: false, status: 500, error: 'Authentication service unavailable' };
+    return { valid: false, status: 503, error: 'Authentication service unavailable' };
   }
 }
 
@@ -273,6 +367,16 @@ setInterval(() => {
   for (const [key, cached] of validationCache) {
     if (now - cached.timestamp > VALIDATION_CACHE_TTL_MS * 2) {
       validationCache.delete(key);
+    }
+  }
+}, 5 * 60_000).unref();
+
+// Clean up stale failed auth records every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of failedAuthByIP) {
+    if (now - record.firstFailure > FAILED_AUTH_WINDOW_MS * 2) {
+      failedAuthByIP.delete(ip);
     }
   }
 }, 5 * 60_000).unref();
@@ -3036,63 +3140,37 @@ io.use(async (socket, next) => {
     return next(new Error('API key required'));
   }
 
-  // Call upstream to validate the key
-  const apiBase = getApiBaseUrl();
-  const proxyApiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+  // Use the same cached validation as REST endpoints (includes timeout)
+  const mockReq = { headers: { authorization: `Bearer ${apiKey}` } };
+  const auth = await validateClientApiKey(mockReq);
 
-  if (!apiBase || !proxyApiKey) {
-    logger.error('WebSocket auth failed: proxy not configured');
-    return next(new Error('Authentication service unavailable'));
+  if (!auth.valid) {
+    logger.warn(`WebSocket connection rejected: ${auth.error}`);
+    return next(new Error(auth.error || 'Invalid API key'));
   }
 
-  try {
-    const resp = await fetch(`${apiBase}/api/internal/validate-key`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${proxyApiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ apiKey }),
-    });
-
-    if (!resp.ok) {
-      logger.warn(`WebSocket auth failed: upstream returned ${resp.status}`);
-      return next(new Error('Authentication failed'));
-    }
-
-    const validation = await resp.json();
-
-    if (!validation.valid) {
-      logger.warn(`WebSocket connection rejected: ${validation.error}`);
-      return next(new Error(validation.error || 'Invalid API key'));
-    }
-
-    // Check if WebSocket is enabled for this tier
-    if (!validation.limits?.websocketEnabled) {
-      logger.warn(`WebSocket connection rejected: tier ${validation.tier} does not have WebSocket access`);
-      return next(new Error('WebSocket requires Rookie or MVP subscription'));
-    }
-
-    // Check connection limit
-    const canConnect = trackWsConnection(validation.userId, socket.id, validation.tier);
-    if (!canConnect) {
-      const maxConns = TIER_LIMITS[validation.tier]?.websocketConnections || 0;
-      logger.warn(`WebSocket connection rejected: userId=${validation.userId} exceeded limit of ${maxConns} connections`);
-      return next(new Error(`Connection limit reached. ${validation.tier} tier allows ${maxConns} concurrent WebSocket connections.`));
-    }
-
-    // Attach auth info to socket for tier-based filtering
-    socket.data.userId = validation.userId;
-    socket.data.tier = validation.tier;
-    socket.data.limits = validation.limits;
-    socket.data.apiKey = apiKey; // Store for disconnect cleanup
-
-    logger.info(`WebSocket authenticated: userId=${validation.userId}, tier=${validation.tier}, connections=${wsConnectionsByUser.get(validation.userId)?.size || 1}`);
-    next();
-  } catch (err) {
-    logger.error(`WebSocket auth error: ${err.message}`);
-    return next(new Error('Authentication failed'));
+  // Check if WebSocket is enabled for this tier
+  if (!auth.limits?.websocketEnabled) {
+    logger.warn(`WebSocket connection rejected: tier ${auth.tier} does not have WebSocket access`);
+    return next(new Error('WebSocket requires Rookie or MVP subscription'));
   }
+
+  // Check connection limit
+  const canConnect = trackWsConnection(auth.userId, socket.id, auth.tier);
+  if (!canConnect) {
+    const maxConns = TIER_LIMITS[auth.tier]?.websocketConnections || 0;
+    logger.warn(`WebSocket connection rejected: userId=${auth.userId} exceeded limit of ${maxConns} connections`);
+    return next(new Error(`Connection limit reached. ${auth.tier} tier allows ${maxConns} concurrent WebSocket connections.`));
+  }
+
+  // Attach auth info to socket for tier-based filtering
+  socket.data.userId = auth.userId;
+  socket.data.tier = auth.tier;
+  socket.data.limits = auth.limits;
+  socket.data.apiKey = apiKey; // Store for disconnect cleanup
+
+  logger.info(`WebSocket authenticated: userId=${auth.userId}, tier=${auth.tier}, connections=${wsConnectionsByUser.get(auth.userId)?.size || 1}`);
+  next();
 });
 
 // Handle downstream client connections (Owls Insight frontend)
