@@ -187,27 +187,14 @@ OwlsInsightServer (this proxy)
     Return tier + limits to proxy
 ```
 
-### Rate Limits by Tier
+### API Tiers & Rate Limits
 
-| Limit | Bench ($9.99) | Rookie ($24.99) | MVP ($49.99) |
-|-------|---------------|-----------------|--------------|
-| **Requests/Month** | 10,000 | 75,000 | 300,000 |
-| **Requests/Minute** | 20 | 120 | 400 |
-| **Concurrent Requests** | 1 | 5 | 15 |
-| **WebSocket Enabled** | No | Yes | Yes |
-| **WebSocket Connections** | 0 | 2 | 5 |
-| **Props Access** | No | Yes | Yes |
-| **History Days** | 0 | 14 | 90 |
-| **Data Delay** | 45 seconds | Real-time | Real-time |
+See [docs/API_TIERS.md](docs/API_TIERS.md) for complete pricing, rate limits, and feature access by tier.
 
-### Rate Limit Headers
-
-All authenticated responses include:
-- `X-RateLimit-Limit` - Requests allowed per minute
-- `X-RateLimit-Remaining` - Requests remaining in current window
-- `X-RateLimit-Reset` - Unix timestamp when window resets
-- `X-RateLimit-Monthly-Limit` - Requests allowed per month
-- `X-RateLimit-Monthly-Remaining` - Requests remaining this month
+**Quick reference:**
+- **Bench** ($9.99): 10k req/month, 20/min, no WebSocket, 45s delay
+- **Rookie** ($24.99): 75k req/month, 120/min, 2 WebSocket connections, real-time
+- **MVP** ($49.99): 300k req/month, 400/min, 5 WebSocket connections, real-time
 
 ### Circuit Breaker
 
@@ -216,26 +203,6 @@ Protects against upstream failures:
 - Returns 503 immediately when open (fail fast)
 - Half-open state after 30 seconds (tries one request)
 - Closes on successful upstream response
-
-### IP Rate Limiting
-
-Prevents brute force attacks:
-- Max 10 failed auth attempts per IP per minute
-- Returns 429 with `Retry-After` header when exceeded
-- Resets on successful authentication
-
-### Feature Access by Tier
-
-| Feature | Bench | Rookie | MVP |
-|---------|-------|--------|-----|
-| Odds (h2h, spreads, totals) | ✓ | ✓ | ✓ |
-| Live Scores | ✓ | ✓ | ✓ |
-| Player Props | ✗ | ✓ | ✓ |
-| EV Calculations | ✗ | ✓ | ✓ |
-| Arbitrage | ✗ | ✓ | ✓ |
-| Historical Data | ✗ | ✓ | ✓ |
-| WebSocket | ✗ | ✓ | ✓ |
-| Props via WebSocket | ✗ | ✓ | ✓ |
 
 ### Client Authentication
 
