@@ -1,10 +1,19 @@
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
+const crypto = require('crypto');
 const cors = require('cors');
 const { Server } = require('socket.io');
 const logger = require('./utils/logger');
 const UpstreamConnector = require('./services/upstreamConnector');
+const database = require('./services/database');
+
+/**
+ * Hash an API key for use as a cache key (avoid storing raw keys in memory)
+ */
+function hashApiKeyForCache(apiKey) {
+  return crypto.createHash('sha256').update(apiKey).digest('hex').substring(0, 16);
+}
 
 // Configuration
 const PORT = process.env.PORT || 3002;
@@ -73,6 +82,13 @@ const CIRCUIT_RESET_TIMEOUT_MS = 30_000; // Try again after 30 seconds
 // Rate limiting: track requests per API key per minute
 const rateLimitBuckets = new Map(); // apiKey -> { count, windowStart }
 
+// Monthly rate limiting: track requests per API key per month
+// Note: Resets on server restart - for persistent tracking, use Redis
+const monthlyUsage = new Map(); // apiKey -> { count, month }
+
+// Concurrent request tracking per API key
+const concurrentRequests = new Map(); // apiKey -> count
+
 // Failed auth rate limiting by IP (prevent brute force)
 const failedAuthByIP = new Map(); // ip -> { count, firstFailure }
 const FAILED_AUTH_WINDOW_MS = 60_000; // 1 minute window
@@ -80,6 +96,13 @@ const FAILED_AUTH_MAX_ATTEMPTS = 10; // Max failures per IP per minute
 
 // WebSocket connection tracking per user
 const wsConnectionsByUser = new Map(); // userId -> Set<socketId>
+
+// Data delay buffer for Bench tier (stores last 60 seconds of data)
+const DATA_DELAY_BUFFER_SIZE = 60; // Keep 60 seconds of snapshots
+const oddsDelayBuffer = []; // Array of { timestamp, data }
+const scoresDelayBuffer = []; // Array of { timestamp, data }
+let delayedOddsData = null; // Cached delayed data for Bench tier
+let delayedScoresData = null;
 
 /**
  * Extract API key from Authorization header
@@ -140,7 +163,8 @@ function clearFailedAuth(ip) {
  */
 async function validateClientApiKey(req) {
   const clientApiKey = extractApiKey(req.headers.authorization);
-  const clientIP = req.ip || req.connection?.remoteAddress || req.headers?.['x-forwarded-for']?.split(',')[0];
+  // Prioritize x-forwarded-for for proper client IP behind ALB/proxy
+  const clientIP = req.headers?.['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.connection?.remoteAddress;
 
   if (!clientApiKey) {
     return { valid: false, status: 401, error: 'API key required' };
@@ -154,7 +178,9 @@ async function validateClientApiKey(req) {
   }
 
   // Check cache first (works even when circuit is open)
-  const cached = validationCache.get(clientApiKey);
+  // Use hashed key to avoid storing raw API keys in memory
+  const cacheKey = hashApiKeyForCache(clientApiKey);
+  const cached = validationCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < VALIDATION_CACHE_TTL_MS) {
     return cached.result;
   }
@@ -187,7 +213,7 @@ async function validateClientApiKey(req) {
         'Authorization': `Bearer ${proxyApiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ apiKey: clientApiKey }),
+      body: JSON.stringify({ apiKey: clientApiKey, trackUsage: true }),
       signal: controller.signal,
     });
 
@@ -204,7 +230,7 @@ async function validateClientApiKey(req) {
       trackFailedAuth(clientIP);
       const result = { valid: false, status: resp.status, error: 'Authentication failed' };
       // Cache negative results for shorter time
-      validationCache.set(clientApiKey, { result, timestamp: Date.now() - VALIDATION_CACHE_TTL_MS + 10_000 });
+      validationCache.set(cacheKey, { result, timestamp: Date.now() - VALIDATION_CACHE_TTL_MS + 10_000 });
       return result;
     }
 
@@ -213,7 +239,7 @@ async function validateClientApiKey(req) {
     if (!validation.valid) {
       trackFailedAuth(clientIP);
       const result = { valid: false, status: 401, error: validation.error || 'Invalid API key' };
-      validationCache.set(clientApiKey, { result, timestamp: Date.now() - VALIDATION_CACHE_TTL_MS + 10_000 });
+      validationCache.set(cacheKey, { result, timestamp: Date.now() - VALIDATION_CACHE_TTL_MS + 10_000 });
       return result;
     }
 
@@ -234,10 +260,12 @@ async function validateClientApiKey(req) {
         dataDelaySeconds: tierConfig.dataDelaySeconds,
       },
       clientApiKey,
+      // Include usage data from upstream (persisted in MySQL)
+      usage: validation.usage || null,
     };
 
     // Cache successful validation
-    validationCache.set(clientApiKey, { result, timestamp: Date.now() });
+    validationCache.set(cacheKey, { result, timestamp: Date.now() });
     return result;
   } catch (err) {
     // Track failures for circuit breaker
@@ -294,6 +322,108 @@ function checkRateLimit(apiKey, tier) {
 }
 
 /**
+ * Check monthly rate limit for an API key
+ * Returns { allowed: boolean, remaining: number, resetDate: string }
+ */
+function checkMonthlyRateLimit(apiKey, tier) {
+  const limits = TIER_LIMITS[tier] || TIER_LIMITS.bench;
+  const maxPerMonth = limits.requestsPerMonth;
+
+  const now = new Date();
+  const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+
+  let usage = monthlyUsage.get(apiKey);
+  if (!usage || usage.month !== currentMonth) {
+    usage = { count: 0, month: currentMonth };
+    monthlyUsage.set(apiKey, usage);
+  }
+
+  if (usage.count >= maxPerMonth) {
+    // Calculate reset date (first of next month)
+    const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    return {
+      allowed: false,
+      remaining: 0,
+      limit: maxPerMonth,
+      resetDate: nextMonth.toISOString(),
+    };
+  }
+
+  usage.count++;
+  return {
+    allowed: true,
+    remaining: maxPerMonth - usage.count,
+    limit: maxPerMonth,
+    used: usage.count,
+  };
+}
+
+/**
+ * Get current monthly usage without incrementing
+ */
+function getMonthlyUsageInMemory(apiKey, tier) {
+  const limits = TIER_LIMITS[tier] || TIER_LIMITS.bench;
+  const maxPerMonth = limits.requestsPerMonth;
+
+  const now = new Date();
+  const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+
+  const usage = monthlyUsage.get(apiKey);
+  if (!usage || usage.month !== currentMonth) {
+    return { used: 0, limit: maxPerMonth, remaining: maxPerMonth };
+  }
+
+  return { used: usage.count, limit: maxPerMonth, remaining: maxPerMonth - usage.count };
+}
+
+/**
+ * Increment monthly usage in memory (fallback when MySQL unavailable)
+ */
+function incrementMonthlyUsageInMemory(apiKey) {
+  const now = new Date();
+  const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+
+  const existing = monthlyUsage.get(apiKey);
+  if (!existing || existing.month !== currentMonth) {
+    monthlyUsage.set(apiKey, { count: 1, month: currentMonth });
+  } else {
+    existing.count++;
+  }
+}
+
+/**
+ * Track start of a concurrent request
+ * Returns { allowed: boolean, current: number, limit: number }
+ */
+function startConcurrentRequest(apiKey, tier) {
+  const limits = TIER_LIMITS[tier] || TIER_LIMITS.bench;
+  const maxConcurrent = limits.concurrentRequests;
+
+  // Increment first to avoid race condition (check-then-act)
+  const current = concurrentRequests.get(apiKey) || 0;
+  const newCount = current + 1;
+  concurrentRequests.set(apiKey, newCount);
+
+  if (newCount > maxConcurrent) {
+    // Rollback and reject
+    concurrentRequests.set(apiKey, current);
+    return { allowed: false, current, limit: maxConcurrent };
+  }
+
+  return { allowed: true, current: newCount, limit: maxConcurrent };
+}
+
+/**
+ * Track end of a concurrent request
+ */
+function endConcurrentRequest(apiKey) {
+  const current = concurrentRequests.get(apiKey) || 0;
+  if (current > 0) {
+    concurrentRequests.set(apiKey, current - 1);
+  }
+}
+
+/**
  * Check if the tier is allowed to access props endpoints
  */
 function canAccessProps(tier) {
@@ -307,6 +437,49 @@ function canAccessProps(tier) {
 function getDataDelay(tier) {
   const limits = TIER_LIMITS[tier];
   return limits?.dataDelaySeconds || 0;
+}
+
+/**
+ * Add data to delay buffer (called when new data arrives)
+ */
+function addToDelayBuffer(buffer, data) {
+  const now = Date.now();
+  buffer.push({ timestamp: now, data: JSON.parse(JSON.stringify(data)) }); // Deep clone
+
+  // Remove entries older than buffer size (60 seconds)
+  const cutoff = now - (DATA_DELAY_BUFFER_SIZE * 1000);
+  while (buffer.length > 0 && buffer[0].timestamp < cutoff) {
+    buffer.shift();
+  }
+}
+
+/**
+ * Get delayed data from buffer (at least delaySeconds old)
+ */
+function getDelayedData(buffer, delaySeconds) {
+  if (buffer.length === 0) return null;
+
+  const cutoff = Date.now() - (delaySeconds * 1000);
+
+  // Find the most recent entry that's old enough
+  for (let i = buffer.length - 1; i >= 0; i--) {
+    if (buffer[i].timestamp <= cutoff) {
+      return buffer[i].data;
+    }
+  }
+
+  // If no data is old enough, return the oldest we have
+  // (better than nothing, will be old enough soon)
+  return buffer[0].data;
+}
+
+/**
+ * Update delayed data cache (call periodically)
+ */
+function updateDelayedDataCache() {
+  const delay = TIER_LIMITS.bench.dataDelaySeconds;
+  delayedOddsData = getDelayedData(oddsDelayBuffer, delay);
+  delayedScoresData = getDelayedData(scoresDelayBuffer, delay);
 }
 
 /**
@@ -381,8 +554,14 @@ setInterval(() => {
   }
 }, 5 * 60_000).unref();
 
+// Update delayed data cache every second (for Bench tier 45-second delay)
+setInterval(() => {
+  updateDelayedDataCache();
+}, 1000).unref();
+
 /**
  * Combined auth + rate limit check for REST endpoints
+ * Checks: auth -> monthly limit -> per-minute limit -> concurrent limit
  * Returns auth result with rate limit headers to set
  */
 async function authenticateAndRateLimit(req, res) {
@@ -392,10 +571,47 @@ async function authenticateAndRateLimit(req, res) {
     return { auth, rateLimited: false };
   }
 
-  // Check rate limit
-  const rateLimit = checkRateLimit(auth.clientApiKey, auth.tier);
+  // Check monthly rate limit - use MySQL if available, otherwise in-memory
+  const tierLimits = TIER_LIMITS[auth.tier] || TIER_LIMITS.bench;
+  let monthlyUsed, monthlyLimit;
+  monthlyLimit = tierLimits.requestsPerMonth;
 
-  // Set rate limit headers
+  if (database.isDatabaseAvailable()) {
+    // Track and get usage from MySQL (persisted across restarts)
+    const usageResult = await database.trackUsageByApiKey(auth.clientApiKey);
+    if (usageResult) {
+      monthlyUsed = usageResult.monthlyUsage;
+    } else {
+      // Database available but tracking failed - use in-memory fallback with increment
+      incrementMonthlyUsageInMemory(auth.clientApiKey);
+      const usage = getMonthlyUsageInMemory(auth.clientApiKey, auth.tier);
+      monthlyUsed = usage.used;
+    }
+  } else {
+    // Fallback to in-memory tracking (resets on restart)
+    incrementMonthlyUsageInMemory(auth.clientApiKey);
+    const usage = getMonthlyUsageInMemory(auth.clientApiKey, auth.tier);
+    monthlyUsed = usage.used;
+  }
+
+  const monthlyRemaining = Math.max(0, monthlyLimit - monthlyUsed);
+  res.set('X-RateLimit-Monthly-Limit', monthlyLimit);
+  res.set('X-RateLimit-Monthly-Remaining', monthlyRemaining);
+
+  if (monthlyUsed >= monthlyLimit) {
+    const now = new Date();
+    const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    logger.warn(`Monthly limit exceeded for userId=${auth.userId}, tier=${auth.tier}, used=${monthlyUsed}/${monthlyLimit}`);
+    return {
+      auth,
+      rateLimited: true,
+      reason: 'monthly',
+      error: `Monthly request limit of ${monthlyLimit} exceeded. Resets on ${nextMonth.toISOString().split('T')[0]}`,
+    };
+  }
+
+  // Check per-minute rate limit
+  const rateLimit = checkRateLimit(auth.clientApiKey, auth.tier);
   res.set('X-RateLimit-Limit', rateLimit.limit);
   res.set('X-RateLimit-Remaining', rateLimit.remaining);
   res.set('X-RateLimit-Reset', Math.ceil((Date.now() + rateLimit.resetIn) / 1000));
@@ -404,27 +620,44 @@ async function authenticateAndRateLimit(req, res) {
     return {
       auth,
       rateLimited: true,
+      reason: 'minute',
       retryAfter: Math.ceil(rateLimit.resetIn / 1000),
     };
   }
 
-  return { auth, rateLimited: false };
+  // Check concurrent request limit
+  const concurrent = startConcurrentRequest(auth.clientApiKey, auth.tier);
+  if (!concurrent.allowed) {
+    logger.warn(`Concurrent limit exceeded for userId=${auth.userId}: ${concurrent.current}/${concurrent.limit}`);
+    return {
+      auth,
+      rateLimited: true,
+      reason: 'concurrent',
+      error: `Maximum ${concurrent.limit} concurrent requests allowed for ${auth.tier} tier`,
+    };
+  }
+
+  // Store apiKey in auth for cleanup
+  return { auth, rateLimited: false, needsConcurrentCleanup: true };
 }
 
 /**
- * Apply data delay for Bench tier
- * Returns filtered data that's at least dataDelaySeconds old
- * For now, this is a placeholder - full implementation would require
- * timestamped snapshots. Currently just returns the data as-is with a note.
+ * Get data for a tier - returns delayed data for Bench, real-time for others
  */
-function applyDataDelay(data, tier) {
+function getDataForTier(realtimeData, delayedData, tier) {
   const delay = getDataDelay(tier);
   if (delay === 0) {
-    return { data, delayed: false };
+    return { data: realtimeData, delayed: false };
   }
-  // TODO: Implement proper delay using historical snapshots
-  // For now, return data with a flag indicating it should be delayed
-  return { data, delayed: true, delaySeconds: delay };
+
+  // Use delayed data for Bench tier
+  if (delayedData) {
+    return { data: delayedData, delayed: true, delaySeconds: delay };
+  }
+
+  // Fallback to realtime if no delayed data available yet
+  // (happens during first 45 seconds of server startup)
+  return { data: realtimeData, delayed: false, delaySeconds: delay, note: 'delayed data not yet available' };
 }
 
 // -----------------------------------------------------------------------------
@@ -599,17 +832,18 @@ function clearSocketWatchers(socketId) {
 
 app.get('/api/history', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   const { eventId, book, market, hours } = req.query;
   if (!eventId || !book || !market) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: 'eventId, book, market are required' });
   }
 
@@ -619,6 +853,10 @@ app.get('/api/history', async (req, res) => {
   } catch (err) {
     logger.error(`History proxy error: ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch history' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
@@ -626,17 +864,18 @@ app.get('/api/history', async (req, res) => {
 // This matches the nba-odds-app /api/odds/history endpoint format
 app.get('/api/odds/history', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   const { eventId, book, market, side, hours } = req.query;
   if (!eventId || !book || !market || !side) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: 'eventId, book, market, side are required' });
   }
 
@@ -671,6 +910,10 @@ app.get('/api/odds/history', async (req, res) => {
   } catch (err) {
     logger.error(`Odds history proxy error: ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch odds history' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
@@ -732,31 +975,40 @@ async function fetchLiveScoresFromUpstream(sport = null) {
 // All sports live scores
 app.get('/api/v1/scores/live', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   try {
+    // Get appropriate data based on tier (delayed for Bench, real-time for others)
+    const { data: scoresData, delayed, delaySeconds } = getDataForTier(latestScoresData, delayedScoresData, auth.tier);
+
     // First try to return cached data from WebSocket
-    if (latestScoresData) {
+    if (scoresData) {
       return res.json({
         success: true,
-        data: latestScoresData,
+        data: scoresData,
         cached: true,
+        ...(delayed && { delayed: true, delaySeconds }),
       });
     }
 
-    // Fall back to upstream API
+    // Fall back to upstream API (no delay applied for fallback)
     const data = await fetchLiveScoresFromUpstream();
     return res.json(data);
   } catch (err) {
     logger.error(`Scores proxy error: ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch scores' });
+  } finally {
+    // Always cleanup concurrent request tracking
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
@@ -764,41 +1016,51 @@ app.get('/api/v1/scores/live', async (req, res) => {
 const VALID_SPORTS = ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'];
 app.get('/api/v1/:sport/scores/live', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   const { sport } = req.params;
 
   if (!VALID_SPORTS.includes(sport)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
   try {
+    // Get appropriate data based on tier (delayed for Bench, real-time for others)
+    const { data: scoresData, delayed, delaySeconds } = getDataForTier(latestScoresData, delayedScoresData, auth.tier);
+
     // First try to return cached data from WebSocket
-    if (latestScoresData) {
-      const sportData = latestScoresData.sports?.[sport] || [];
+    if (scoresData) {
+      const sportData = scoresData.sports?.[sport] || [];
       return res.json({
         success: true,
         sport,
-        timestamp: latestScoresData.timestamp,
+        timestamp: scoresData.timestamp,
         count: sportData.length,
         events: sportData,
         cached: true,
+        ...(delayed && { delayed: true, delaySeconds }),
       });
     }
 
-    // Fall back to upstream API
+    // Fall back to upstream API (no delay applied for fallback)
     const data = await fetchLiveScoresFromUpstream(sport);
     return res.json(data);
   } catch (err) {
     logger.error(`Scores proxy error (${sport}): ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch scores' });
+  } finally {
+    // Always cleanup concurrent request tracking
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
@@ -818,58 +1080,63 @@ function filterBookmakerMarkets(bookmakers, marketKey) {
 // All odds for a sport (from WebSocket cache)
 app.get('/api/v1/:sport/odds', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   const { sport } = req.params;
   const { eventId, books } = req.query;
 
   if (!VALID_SPORTS.includes(sport)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
-  // Return cached data from WebSocket
-  if (latestOddsData) {
-    let sportData = latestOddsData[sport] || [];
-
-    // Filter by eventId if provided
-    if (eventId) {
-      sportData = sportData.filter(g =>
-        g.eventId === eventId || g.id === eventId || g.event_id === eventId
-      );
-    }
-
-    // Filter by books if provided
-    if (books) {
-      const bookList = books.split(',').map(b => b.trim().toLowerCase());
-      sportData = sportData.map(g => ({
-        ...g,
-        bookmakers: (g.bookmakers || []).filter(b =>
-          bookList.includes((b.key || '').toLowerCase())
-        )
-      }));
-    }
-
-    return res.json({
-      success: true,
-      data: sportData,
-      meta: {
-        sport,
-        count: sportData.length,
-        timestamp: new Date().toISOString(),
-        cached: true,
-      }
-    });
-  }
-
-  // Fall back to upstream API
   try {
+    // Get appropriate data based on tier (delayed for Bench, real-time for others)
+    const { data: oddsData, delayed, delaySeconds } = getDataForTier(latestOddsData, delayedOddsData, auth.tier);
+
+    // Return cached data from WebSocket
+    if (oddsData) {
+      let sportData = oddsData[sport] || [];
+
+      // Filter by eventId if provided
+      if (eventId) {
+        sportData = sportData.filter(g =>
+          g.eventId === eventId || g.id === eventId || g.event_id === eventId
+        );
+      }
+
+      // Filter by books if provided
+      if (books) {
+        const bookList = books.split(',').map(b => b.trim().toLowerCase());
+        sportData = sportData.map(g => ({
+          ...g,
+          bookmakers: (g.bookmakers || []).filter(b =>
+            bookList.includes((b.key || '').toLowerCase())
+          )
+        }));
+      }
+
+      return res.json({
+        success: true,
+        data: sportData,
+        meta: {
+          sport,
+          count: sportData.length,
+          timestamp: new Date().toISOString(),
+          cached: true,
+          ...(delayed && { delayed: true, delaySeconds }),
+        }
+      });
+    }
+
+    // Fall back to upstream API (no delay applied for fallback)
     const apiBase = getApiBaseUrl();
     const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
@@ -894,68 +1161,78 @@ app.get('/api/v1/:sport/odds', async (req, res) => {
   } catch (err) {
     logger.error(`Odds proxy error (${sport}): ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch odds' });
+  } finally {
+    // Always cleanup concurrent request tracking
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
 // Moneyline only (h2h market)
 app.get('/api/v1/:sport/moneyline', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   const { sport } = req.params;
   const { eventId, books } = req.query;
 
   if (!VALID_SPORTS.includes(sport)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
-  if (latestOddsData) {
-    let sportData = latestOddsData[sport] || [];
+  try {
+    // Get appropriate data based on tier (delayed for Bench, real-time for others)
+    const { data: oddsData, delayed, delaySeconds } = getDataForTier(latestOddsData, delayedOddsData, auth.tier);
 
-    if (eventId) {
-      sportData = sportData.filter(g =>
-        g.eventId === eventId || g.id === eventId || g.event_id === eventId
-      );
-    }
+    if (oddsData) {
+      let sportData = oddsData[sport] || [];
 
-    // Filter to only h2h markets
-    sportData = sportData.map(g => ({
-      ...g,
-      bookmakers: filterBookmakerMarkets(g.bookmakers, 'h2h')
-    }));
+      if (eventId) {
+        sportData = sportData.filter(g =>
+          g.eventId === eventId || g.id === eventId || g.event_id === eventId
+        );
+      }
 
-    if (books) {
-      const bookList = books.split(',').map(b => b.trim().toLowerCase());
+      // Filter to only h2h markets
       sportData = sportData.map(g => ({
         ...g,
-        bookmakers: (g.bookmakers || []).filter(b =>
-          bookList.includes((b.key || '').toLowerCase())
-        )
+        bookmakers: filterBookmakerMarkets(g.bookmakers, 'h2h')
       }));
+
+      if (books) {
+        const bookList = books.split(',').map(b => b.trim().toLowerCase());
+        sportData = sportData.map(g => ({
+          ...g,
+          bookmakers: (g.bookmakers || []).filter(b =>
+            bookList.includes((b.key || '').toLowerCase())
+          )
+        }));
+      }
+
+      return res.json({
+        success: true,
+        data: sportData,
+        meta: {
+          sport,
+          market: 'h2h',
+          count: sportData.length,
+          timestamp: new Date().toISOString(),
+          cached: true,
+          ...(delayed && { delayed: true, delaySeconds }),
+        }
+      });
     }
 
-    return res.json({
-      success: true,
-      data: sportData,
-      meta: {
-        sport,
-        market: 'h2h',
-        count: sportData.length,
-        timestamp: new Date().toISOString(),
-        cached: true,
-      }
-    });
-  }
-
-  // Fall back to upstream
-  try {
+    // Fall back to upstream
     const apiBase = getApiBaseUrl();
     const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
@@ -980,68 +1257,77 @@ app.get('/api/v1/:sport/moneyline', async (req, res) => {
   } catch (err) {
     logger.error(`Moneyline proxy error (${sport}): ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch moneyline' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
 // Spreads only
 app.get('/api/v1/:sport/spreads', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   const { sport } = req.params;
   const { eventId, books } = req.query;
 
   if (!VALID_SPORTS.includes(sport)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
-  if (latestOddsData) {
-    let sportData = latestOddsData[sport] || [];
+  try {
+    // Get appropriate data based on tier (delayed for Bench, real-time for others)
+    const { data: oddsData, delayed, delaySeconds } = getDataForTier(latestOddsData, delayedOddsData, auth.tier);
 
-    if (eventId) {
-      sportData = sportData.filter(g =>
-        g.eventId === eventId || g.id === eventId || g.event_id === eventId
-      );
-    }
+    if (oddsData) {
+      let sportData = oddsData[sport] || [];
 
-    // Filter to only spreads markets
-    sportData = sportData.map(g => ({
-      ...g,
-      bookmakers: filterBookmakerMarkets(g.bookmakers, 'spreads')
-    }));
+      if (eventId) {
+        sportData = sportData.filter(g =>
+          g.eventId === eventId || g.id === eventId || g.event_id === eventId
+        );
+      }
 
-    if (books) {
-      const bookList = books.split(',').map(b => b.trim().toLowerCase());
+      // Filter to only spreads markets
       sportData = sportData.map(g => ({
         ...g,
-        bookmakers: (g.bookmakers || []).filter(b =>
-          bookList.includes((b.key || '').toLowerCase())
-        )
+        bookmakers: filterBookmakerMarkets(g.bookmakers, 'spreads')
       }));
+
+      if (books) {
+        const bookList = books.split(',').map(b => b.trim().toLowerCase());
+        sportData = sportData.map(g => ({
+          ...g,
+          bookmakers: (g.bookmakers || []).filter(b =>
+            bookList.includes((b.key || '').toLowerCase())
+          )
+        }));
+      }
+
+      return res.json({
+        success: true,
+        data: sportData,
+        meta: {
+          sport,
+          market: 'spreads',
+          count: sportData.length,
+          timestamp: new Date().toISOString(),
+          cached: true,
+          ...(delayed && { delayed: true, delaySeconds }),
+        }
+      });
     }
 
-    return res.json({
-      success: true,
-      data: sportData,
-      meta: {
-        sport,
-        market: 'spreads',
-        count: sportData.length,
-        timestamp: new Date().toISOString(),
-        cached: true,
-      }
-    });
-  }
-
-  // Fall back to upstream
-  try {
+    // Fall back to upstream
     const apiBase = getApiBaseUrl();
     const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
@@ -1066,68 +1352,77 @@ app.get('/api/v1/:sport/spreads', async (req, res) => {
   } catch (err) {
     logger.error(`Spreads proxy error (${sport}): ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch spreads' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
 // Totals only
 app.get('/api/v1/:sport/totals', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   const { sport } = req.params;
   const { eventId, books } = req.query;
 
   if (!VALID_SPORTS.includes(sport)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
-  if (latestOddsData) {
-    let sportData = latestOddsData[sport] || [];
+  try {
+    // Get appropriate data based on tier (delayed for Bench, real-time for others)
+    const { data: oddsData, delayed, delaySeconds } = getDataForTier(latestOddsData, delayedOddsData, auth.tier);
 
-    if (eventId) {
-      sportData = sportData.filter(g =>
-        g.eventId === eventId || g.id === eventId || g.event_id === eventId
-      );
-    }
+    if (oddsData) {
+      let sportData = oddsData[sport] || [];
 
-    // Filter to only totals markets
-    sportData = sportData.map(g => ({
-      ...g,
-      bookmakers: filterBookmakerMarkets(g.bookmakers, 'totals')
-    }));
+      if (eventId) {
+        sportData = sportData.filter(g =>
+          g.eventId === eventId || g.id === eventId || g.event_id === eventId
+        );
+      }
 
-    if (books) {
-      const bookList = books.split(',').map(b => b.trim().toLowerCase());
+      // Filter to only totals markets
       sportData = sportData.map(g => ({
         ...g,
-        bookmakers: (g.bookmakers || []).filter(b =>
-          bookList.includes((b.key || '').toLowerCase())
-        )
+        bookmakers: filterBookmakerMarkets(g.bookmakers, 'totals')
       }));
+
+      if (books) {
+        const bookList = books.split(',').map(b => b.trim().toLowerCase());
+        sportData = sportData.map(g => ({
+          ...g,
+          bookmakers: (g.bookmakers || []).filter(b =>
+            bookList.includes((b.key || '').toLowerCase())
+          )
+        }));
+      }
+
+      return res.json({
+        success: true,
+        data: sportData,
+        meta: {
+          sport,
+          market: 'totals',
+          count: sportData.length,
+          timestamp: new Date().toISOString(),
+          cached: true,
+          ...(delayed && { delayed: true, delaySeconds }),
+        }
+      });
     }
 
-    return res.json({
-      success: true,
-      data: sportData,
-      meta: {
-        sport,
-        market: 'totals',
-        count: sportData.length,
-        timestamp: new Date().toISOString(),
-        cached: true,
-      }
-    });
-  }
-
-  // Fall back to upstream
-  try {
+    // Fall back to upstream
     const apiBase = getApiBaseUrl();
     const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
@@ -1152,6 +1447,10 @@ app.get('/api/v1/:sport/totals', async (req, res) => {
   } catch (err) {
     logger.error(`Totals proxy error (${sport}): ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch totals' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
@@ -1199,17 +1498,18 @@ const mergeBookIntoGames = (gamesMap, bookData, sport) => {
 
 app.get('/api/v1/:sport/props', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   // Props require Rookie or MVP tier
   if (!canAccessProps(auth.tier)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
   }
 
@@ -1219,6 +1519,7 @@ app.get('/api/v1/:sport/props', async (req, res) => {
   console.log(`[DEBUG Props] GET /api/v1/${sport}/props - query:`, { game_id, player, category });
 
   if (!VALID_SPORTS.includes(sport)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
@@ -1340,6 +1641,10 @@ app.get('/api/v1/:sport/props', async (req, res) => {
   } catch (err) {
     logger.error(`Props proxy error (${sport}): ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch props' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
@@ -1350,17 +1655,18 @@ app.get('/api/v1/:sport/props', async (req, res) => {
 // Bet365 Props proxy - uses WebSocket cache first, falls back to upstream
 app.get('/api/v1/:sport/props/bet365', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   // Props require Rookie or MVP tier
   if (!canAccessProps(auth.tier)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
   }
 
@@ -1368,6 +1674,7 @@ app.get('/api/v1/:sport/props/bet365', async (req, res) => {
   const { game_id, player, category } = req.query;
 
   if (!VALID_SPORTS.includes(sport)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
@@ -1448,23 +1755,28 @@ app.get('/api/v1/:sport/props/bet365', async (req, res) => {
   } catch (err) {
     logger.error(`Bet365 props proxy error (${sport}): ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch bet365 props' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
 // Bet365 Props stats endpoint
 app.get('/api/v1/props/bet365/stats', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   // Props require Rookie or MVP tier
   if (!canAccessProps(auth.tier)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
   }
 
@@ -1491,23 +1803,28 @@ app.get('/api/v1/props/bet365/stats', async (req, res) => {
   } catch (err) {
     logger.error(`Bet365 props stats proxy error: ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch bet365 props stats' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
 // FanDuel Props stats endpoint
 app.get('/api/v1/props/fanduel/stats', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   // Props require Rookie or MVP tier
   if (!canAccessProps(auth.tier)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
   }
 
@@ -1534,23 +1851,28 @@ app.get('/api/v1/props/fanduel/stats', async (req, res) => {
   } catch (err) {
     logger.error(`FanDuel props stats proxy error: ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch fanduel props stats' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
 // FanDuel Props proxy - uses WebSocket cache first, falls back to upstream
 app.get('/api/v1/:sport/props/fanduel', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   // Props require Rookie or MVP tier
   if (!canAccessProps(auth.tier)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
   }
 
@@ -1558,6 +1880,7 @@ app.get('/api/v1/:sport/props/fanduel', async (req, res) => {
   const { game_id, player, category } = req.query;
 
   if (!VALID_SPORTS.includes(sport)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
@@ -1638,6 +1961,10 @@ app.get('/api/v1/:sport/props/fanduel', async (req, res) => {
   } catch (err) {
     logger.error(`FanDuel props proxy error (${sport}): ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch fanduel props' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
@@ -1648,17 +1975,18 @@ app.get('/api/v1/:sport/props/fanduel', async (req, res) => {
 // DraftKings Props proxy - uses WebSocket cache first, falls back to upstream
 app.get('/api/v1/:sport/props/draftkings', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   // Props require Rookie or MVP tier
   if (!canAccessProps(auth.tier)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
   }
 
@@ -1666,6 +1994,7 @@ app.get('/api/v1/:sport/props/draftkings', async (req, res) => {
   const { game_id, player, category } = req.query;
 
   if (!VALID_SPORTS.includes(sport)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
@@ -1746,6 +2075,10 @@ app.get('/api/v1/:sport/props/draftkings', async (req, res) => {
   } catch (err) {
     logger.error(`DraftKings props proxy error (${sport}): ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch draftkings props' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
@@ -1756,17 +2089,18 @@ app.get('/api/v1/:sport/props/draftkings', async (req, res) => {
 // Props history - fetches historical player props from upstream
 app.get('/api/v1/:sport/props/history', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   // Props require Rookie or MVP tier
   if (!canAccessProps(auth.tier)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(403).json({ success: false, error: 'Player props require Rookie or MVP subscription' });
   }
 
@@ -1775,6 +2109,7 @@ app.get('/api/v1/:sport/props/history', async (req, res) => {
   const resolvedGameId = game_id || eventId;
 
   if (!VALID_SPORTS.includes(sport)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
@@ -1812,6 +2147,10 @@ app.get('/api/v1/:sport/props/history', async (req, res) => {
   } catch (err) {
     logger.error(`Props history proxy error (${sport}): ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch props history' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
@@ -1823,17 +2162,18 @@ app.get('/api/v1/:sport/props/history', async (req, res) => {
 // EV data is included in WebSocket odds broadcasts, so check latestOddsData first
 app.get('/api/v1/:sport/ev', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   // EV calculations require Rookie or MVP tier
   if (!canAccessProps(auth.tier)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(403).json({ success: false, error: 'EV calculations require Rookie or MVP subscription' });
   }
 
@@ -1841,6 +2181,7 @@ app.get('/api/v1/:sport/ev', async (req, res) => {
   const { eventId, books, min_ev } = req.query;
 
   if (!VALID_SPORTS.includes(sport)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
@@ -1873,23 +2214,28 @@ app.get('/api/v1/:sport/ev', async (req, res) => {
   } catch (err) {
     logger.error(`EV proxy error (${sport}): ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch ev data' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
 // EV History proxy - fetches historical EV data from upstream
 app.get('/api/odds/ev/history', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   // EV calculations require Rookie or MVP tier
   if (!canAccessProps(auth.tier)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(403).json({ success: false, error: 'EV calculations require Rookie or MVP subscription' });
   }
 
@@ -1897,6 +2243,7 @@ app.get('/api/odds/ev/history', async (req, res) => {
 
   // Validate required params
   if (!eventId || !book || !market || !side) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({
       success: false,
       error: 'eventId, book, market, and side are required',
@@ -1934,6 +2281,10 @@ app.get('/api/odds/ev/history', async (req, res) => {
   } catch (err) {
     logger.error(`EV history proxy error: ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch ev history' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
@@ -1944,17 +2295,18 @@ app.get('/api/odds/ev/history', async (req, res) => {
 // Analytics - fetches odds analytics from upstream
 app.get('/api/odds/analytics', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   // Analytics require Rookie or MVP tier
   if (!canAccessProps(auth.tier)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(403).json({ success: false, error: 'Analytics require Rookie or MVP subscription' });
   }
 
@@ -1990,6 +2342,10 @@ app.get('/api/odds/analytics', async (req, res) => {
   } catch (err) {
     logger.error(`Analytics proxy error: ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch analytics' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
@@ -1999,13 +2355,13 @@ app.get('/api/odds/analytics', async (req, res) => {
 
 app.get('/api/v1/coverage', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   const SPORTS = ['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf'];
@@ -2080,6 +2436,11 @@ app.get('/api/v1/coverage', async (req, res) => {
     });
   });
 
+  // Cleanup concurrent request tracking
+  if (needsConcurrentCleanup && auth.clientApiKey) {
+    endConcurrentRequest(auth.clientApiKey);
+  }
+
   res.json({
     success: true,
     timestamp: new Date().toISOString(),
@@ -2102,17 +2463,18 @@ app.get('/api/v1/coverage', async (req, res) => {
 // Arbitrage data is included in WebSocket odds broadcasts
 app.get('/api/v1/:sport/arbitrage', async (req, res) => {
   // Validate client API key and check rate limit
-  const { auth, rateLimited, retryAfter } = await authenticateAndRateLimit(req, res);
+  const { auth, rateLimited, retryAfter, reason, error, needsConcurrentCleanup } = await authenticateAndRateLimit(req, res);
   if (!auth.valid) {
     return res.status(auth.status).json({ success: false, error: auth.error });
   }
   if (rateLimited) {
-    res.set('Retry-After', retryAfter);
-    return res.status(429).json({ success: false, error: 'Rate limit exceeded', retryAfter });
+    if (retryAfter) res.set('Retry-After', retryAfter);
+    return res.status(429).json({ success: false, error: error || 'Rate limit exceeded', reason, retryAfter });
   }
 
   // Arbitrage requires Rookie or MVP tier
   if (!canAccessProps(auth.tier)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(403).json({ success: false, error: 'Arbitrage calculations require Rookie or MVP subscription' });
   }
 
@@ -2120,6 +2482,7 @@ app.get('/api/v1/:sport/arbitrage', async (req, res) => {
   const { min_profit } = req.query;
 
   if (!VALID_SPORTS.includes(sport)) {
+    if (needsConcurrentCleanup && auth.clientApiKey) endConcurrentRequest(auth.clientApiKey);
     return res.status(400).json({ success: false, error: `Invalid sport: ${sport}` });
   }
 
@@ -2149,6 +2512,10 @@ app.get('/api/v1/:sport/arbitrage', async (req, res) => {
   } catch (err) {
     logger.error(`Arbitrage proxy error (${sport}): ${err.message}`);
     return res.status(502).json({ success: false, error: 'failed to fetch arbitrage data' });
+  } finally {
+    if (needsConcurrentCleanup && auth.clientApiKey) {
+      endConcurrentRequest(auth.clientApiKey);
+    }
   }
 });
 
@@ -2689,6 +3056,9 @@ function broadcastOddsUpdate(data) {
   // Fire-and-forget debug probe
   debugProbeHistory(payload.sports);
 
+  // Add to delay buffer for Bench tier delayed data
+  addToDelayBuffer(oddsDelayBuffer, payload);
+
   if (process.env.DEBUG_OWLS_INSIGHT === 'true') {
     const keys = payload.sports && typeof payload.sports === 'object' ? Object.keys(payload.sports) : [];
     // eslint-disable-next-line no-console
@@ -2770,6 +3140,9 @@ function broadcastScoresUpdate(data) {
     sports: data.sports || {},
     timestamp: data.timestamp || new Date().toISOString(),
   };
+
+  // Add to delay buffer for Bench tier delayed data
+  addToDelayBuffer(scoresDelayBuffer, payload);
 
   io.emit('scores-update', payload);
   logger.info(`Broadcasted scores update to ${io.engine.clientsCount} clients (${Object.values(payload.sports).flat().length} live games)`);
@@ -3171,7 +3544,6 @@ io.use(async (socket, next) => {
   socket.data.userId = auth.userId;
   socket.data.tier = auth.tier;
   socket.data.limits = auth.limits;
-  socket.data.apiKey = apiKey; // Store for disconnect cleanup
 
   logger.info(`WebSocket authenticated: userId=${auth.userId}, tier=${auth.tier}, connections=${wsConnectionsByUser.get(auth.userId)?.size || 1}`);
   next();
@@ -3516,6 +3888,14 @@ server.listen(PORT, () => {
   logger.info('='.repeat(50));
   logger.info(`Server running on port ${PORT}`);
   logger.info(`CORS Origin: ${CORS_ORIGIN}`);
+
+  // Initialize MySQL for usage tracking
+  const dbInitialized = database.initDatabase();
+  if (dbInitialized) {
+    logger.info('MySQL usage tracking: ENABLED');
+  } else {
+    logger.warn('MySQL usage tracking: DISABLED (in-memory fallback)');
+  }
   logger.info('='.repeat(50));
 
   // Initialize upstream WebSocket connection
@@ -3540,11 +3920,12 @@ server.listen(PORT, () => {
 });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   logger.info('SIGTERM received, shutting down...');
   if (upstreamConnector) {
     upstreamConnector.disconnect();
   }
+  await database.closeDatabase();
   io.close(() => {
     server.close(() => {
       logger.info('Server closed');
@@ -3553,11 +3934,12 @@ process.on('SIGTERM', () => {
   });
 });
 
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   logger.info('SIGINT received, shutting down...');
   if (upstreamConnector) {
     upstreamConnector.disconnect();
   }
+  await database.closeDatabase();
   io.close(() => {
     server.close(() => {
       logger.info('Server closed');

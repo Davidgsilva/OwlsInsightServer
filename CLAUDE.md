@@ -151,6 +151,12 @@ Optional:
 - `OWLS_INSIGHT_API_BASE_URL` - Override base URL for history API (derived from `UPSTREAM_WS_URL` if not set)
 - `DEBUG_OWLS_INSIGHT` (default: false) - Set to `true` for verbose debug logging of data flow
 
+MySQL (for persistent rate limiting - falls back to in-memory if not configured):
+- `MYSQL_HOST` - MySQL host (same RDS as nba-odds-app)
+- `MYSQL_USER` - MySQL username
+- `MYSQL_PASSWORD` - MySQL password
+- `MYSQL_DATABASE` (default: `owls_insight`) - Database name
+
 ## API Key Authentication & Rate Limiting
 
 All REST endpoints and WebSocket connections require a valid API key (except `/health` and `/internal/connections`).
@@ -187,13 +193,12 @@ OwlsInsightServer (this proxy)
 |-------|---------------|-----------------|--------------|
 | **Requests/Month** | 10,000 | 75,000 | 300,000 |
 | **Requests/Minute** | 20 | 120 | 400 |
+| **Concurrent Requests** | 1 | 5 | 15 |
 | **WebSocket Enabled** | No | Yes | Yes |
 | **WebSocket Connections** | 0 | 2 | 5 |
 | **Props Access** | No | Yes | Yes |
 | **History Days** | 0 | 14 | 90 |
-| **Data Delay** | 45 seconds* | Real-time | Real-time |
-
-*Data delay not yet implemented - all tiers get real-time data currently.
+| **Data Delay** | 45 seconds | Real-time | Real-time |
 
 ### Rate Limit Headers
 
@@ -201,6 +206,8 @@ All authenticated responses include:
 - `X-RateLimit-Limit` - Requests allowed per minute
 - `X-RateLimit-Remaining` - Requests remaining in current window
 - `X-RateLimit-Reset` - Unix timestamp when window resets
+- `X-RateLimit-Monthly-Limit` - Requests allowed per month
+- `X-RateLimit-Monthly-Remaining` - Requests remaining this month
 
 ### Circuit Breaker
 
@@ -251,11 +258,24 @@ const socket = io('wss://ws.owlsinsight.com', {
 });
 ```
 
+### Rate Limiting Implementation
+
+All rate limits are now enforced:
+
+1. **Monthly limits** - Persisted in MySQL (`usage_daily` table), resets on the 1st of each month
+2. **Per-minute limits** - Sliding window per API key (in-memory)
+3. **Concurrent request limits** - Per API key (Bench: 1, Rookie: 5, MVP: 15)
+4. **Data delay for Bench tier** - 45-second delayed data for odds and scores endpoints
+
+Rate limit responses include:
+- HTTP 429 with `reason` field (`"minute"`, `"monthly"`, or `"concurrent"`)
+- `Retry-After` header for per-minute limits
+- `X-RateLimit-*` headers for remaining quota
+
 ### Known Limitations
 
-1. **Monthly limits not enforced** - Only per-minute rate limiting is active
-2. **Concurrent request limits not enforced** - Defined but not tracked
-3. **Data delay not implemented** - Bench tier gets real-time data (should be 45s delayed)
+1. **Data delay only applies to cached data** - Fallback to upstream returns real-time data
+2. **MySQL required for persistent monthly limits** - Without MySQL config, monthly limits reset on server restart (uses in-memory fallback)
 
 ## Multi-Repo Architecture
 
