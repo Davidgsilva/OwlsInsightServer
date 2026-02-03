@@ -16,6 +16,115 @@ app.use(cors({ origin: CORS_ORIGIN }));
 app.use(express.json());
 
 // -----------------------------------------------------------------------------
+// API Key Authentication Middleware for Public API Routes
+// -----------------------------------------------------------------------------
+// Validates client API keys via the backend's /api/internal/validate-key endpoint.
+// Caches valid keys for 60 seconds to reduce validation overhead.
+
+const apiKeyCache = new Map(); // key -> { valid, userId, tier, limits, expiresAt }
+const API_KEY_CACHE_TTL_MS = 60 * 1000; // 60 seconds
+
+/**
+ * Extract API key from Authorization header
+ * Supports: "Bearer <key>" or just "<key>"
+ */
+function extractApiKey(authHeader) {
+  if (!authHeader) return null;
+  if (authHeader.startsWith('Bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+  return authHeader.trim();
+}
+
+/**
+ * Validate an API key against the backend
+ * Returns: { valid, userId?, tier?, limits?, error? }
+ */
+async function validateApiKey(clientApiKey) {
+  // Check cache first
+  const cached = apiKeyCache.get(clientApiKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached;
+  }
+
+  const apiBase = getApiBaseUrl();
+  const serverApiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+
+  if (!apiBase || !serverApiKey) {
+    return { valid: false, error: 'API validation not configured' };
+  }
+
+  try {
+    const resp = await fetch(`${apiBase}/api/internal/validate-key`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${serverApiKey}`,
+      },
+      body: JSON.stringify({ apiKey: clientApiKey }),
+    });
+
+    const result = await resp.json();
+
+    // Cache valid keys
+    if (result.valid) {
+      apiKeyCache.set(clientApiKey, {
+        ...result,
+        expiresAt: Date.now() + API_KEY_CACHE_TTL_MS,
+      });
+    }
+
+    return result;
+  } catch (err) {
+    logger.error(`API key validation error: ${err.message}`);
+    return { valid: false, error: 'Validation service unavailable' };
+  }
+}
+
+/**
+ * Middleware: Require valid API key for /api/v1/* routes
+ * Attaches validated key info to req.apiKeyInfo for downstream use
+ */
+async function requireApiKey(req, res, next) {
+  const authHeader = req.headers.authorization;
+  const clientApiKey = extractApiKey(authHeader);
+
+  if (!clientApiKey) {
+    return res.status(401).json({
+      success: false,
+      error: 'Authentication required',
+      message: 'Provide an API key in the Authorization header (format: "Bearer <api_key>")',
+      docs: 'https://owlsinsight.com/docs',
+    });
+  }
+
+  const validation = await validateApiKey(clientApiKey);
+
+  if (!validation.valid) {
+    return res.status(401).json({
+      success: false,
+      error: validation.error || 'Invalid API key',
+      message: 'The provided API key is invalid or has been deactivated',
+    });
+  }
+
+  // Attach validated info to request for downstream handlers
+  req.apiKeyInfo = {
+    userId: validation.userId,
+    tier: validation.tier,
+    limits: validation.limits,
+    apiKey: clientApiKey, // Pass through for backend rate limiting
+  };
+
+  next();
+}
+
+// Apply API key authentication to all public API routes
+app.use('/api/v1', requireApiKey);
+app.use('/api/odds', requireApiKey);
+app.use('/api/history', requireApiKey);
+
+// -----------------------------------------------------------------------------
 // History proxy endpoint
 // -----------------------------------------------------------------------------
 
@@ -53,12 +162,12 @@ const marketMap = {
   h2h: { market: 'h2h', sides: ['away', 'home'] },
 };
 
-async function fetchCombinedHistory({ eventId, book, market, hours }) {
+async function fetchCombinedHistory({ eventId, book, market, hours, clientApiKey }) {
   const cfg = marketMap[String(market).toLowerCase()];
   if (!cfg) throw new Error('invalid market');
 
   const apiBase = getApiBaseUrl();
-  const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+  const apiKey = clientApiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
   if (!apiBase || !apiKey) throw new Error('history proxy not configured');
 
   const cacheKey = `${eventId}|${book}|${cfg.market}|${hours || ''}`;
@@ -192,7 +301,7 @@ app.get('/api/history', async (req, res) => {
   }
 
   try {
-    const data = await fetchCombinedHistory({ eventId, book, market, hours });
+    const data = await fetchCombinedHistory({ eventId, book, market, hours, clientApiKey: req.apiKeyInfo?.apiKey });
     return res.json(data);
   } catch (err) {
     logger.error(`History proxy error: ${err.message}`);
@@ -210,7 +319,7 @@ app.get('/api/odds/history', async (req, res) => {
 
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'history proxy not configured' });
     }
@@ -250,7 +359,7 @@ let scoresCache = { data: null, timestamp: 0 };
 
 async function fetchLiveScoresFromUpstream(sport = null) {
   const apiBase = getApiBaseUrl();
-  const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+  const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
   if (!apiBase || !apiKey) throw new Error('scores proxy not configured');
 
   // Check cache first
@@ -409,7 +518,7 @@ app.get('/api/v1/:sport/odds', async (req, res) => {
   // Fall back to upstream API
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'odds proxy not configured' });
     }
@@ -485,7 +594,7 @@ app.get('/api/v1/:sport/moneyline', async (req, res) => {
   // Fall back to upstream
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'moneyline proxy not configured' });
     }
@@ -561,7 +670,7 @@ app.get('/api/v1/:sport/spreads', async (req, res) => {
   // Fall back to upstream
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'spreads proxy not configured' });
     }
@@ -637,7 +746,7 @@ app.get('/api/v1/:sport/totals', async (req, res) => {
   // Fall back to upstream
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'totals proxy not configured' });
     }
@@ -807,7 +916,7 @@ app.get('/api/v1/:sport/props', async (req, res) => {
   // Fall back to upstream API
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'props proxy not configured' });
     }
@@ -900,7 +1009,7 @@ app.get('/api/v1/:sport/props/bet365', async (req, res) => {
   // Fall back to upstream API
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'bet365 props proxy not configured' });
     }
@@ -933,7 +1042,7 @@ app.get('/api/v1/:sport/props/bet365', async (req, res) => {
 app.get('/api/v1/props/bet365/stats', async (req, res) => {
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'bet365 stats proxy not configured' });
     }
@@ -961,7 +1070,7 @@ app.get('/api/v1/props/bet365/stats', async (req, res) => {
 app.get('/api/v1/props/fanduel/stats', async (req, res) => {
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'fanduel stats proxy not configured' });
     }
@@ -1045,7 +1154,7 @@ app.get('/api/v1/:sport/props/fanduel', async (req, res) => {
   // Fall back to upstream API
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'fanduel props proxy not configured' });
     }
@@ -1138,7 +1247,7 @@ app.get('/api/v1/:sport/props/draftkings', async (req, res) => {
   // Fall back to upstream API
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'draftkings props proxy not configured' });
     }
@@ -1183,7 +1292,7 @@ app.get('/api/v1/:sport/props/history', async (req, res) => {
 
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'props history proxy not configured' });
     }
@@ -1235,7 +1344,7 @@ app.get('/api/v1/:sport/ev', async (req, res) => {
   // Fall back to upstream API (EV requires tier validation on backend)
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'ev proxy not configured' });
     }
@@ -1278,7 +1387,7 @@ app.get('/api/odds/ev/history', async (req, res) => {
 
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'ev history proxy not configured' });
     }
@@ -1320,7 +1429,7 @@ app.get('/api/odds/analytics', async (req, res) => {
 
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'analytics proxy not configured' });
     }
@@ -1458,7 +1567,7 @@ app.get('/api/v1/:sport/arbitrage', async (req, res) => {
 
   try {
     const apiBase = getApiBaseUrl();
-    const apiKey = process.env.OWLS_INSIGHT_SERVER_API_KEY;
+    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
     if (!apiBase || !apiKey) {
       return res.status(502).json({ success: false, error: 'arbitrage proxy not configured' });
     }
