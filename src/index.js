@@ -1264,52 +1264,6 @@ app.get('/api/v1/:sport/ev', async (req, res) => {
   }
 });
 
-// EV History proxy - fetches historical EV data from upstream
-app.get('/api/odds/ev/history', async (req, res) => {
-  const { eventId, book, market, side, hours } = req.query;
-
-  // Validate required params
-  if (!eventId || !book || !market || !side) {
-    return res.status(400).json({
-      success: false,
-      error: 'eventId, book, market, and side are required',
-    });
-  }
-
-  try {
-    const apiBase = getApiBaseUrl();
-    const apiKey = req.apiKeyInfo?.apiKey || process.env.OWLS_INSIGHT_SERVER_API_KEY;
-    if (!apiBase || !apiKey) {
-      return res.status(502).json({ success: false, error: 'ev history proxy not configured' });
-    }
-
-    const params = new URLSearchParams({
-      eventId: String(eventId),
-      book: String(book),
-      market: String(market),
-      side: String(side),
-    });
-    if (hours) params.set('hours', String(hours));
-
-    const url = `${apiBase}/api/odds/ev/history?${params.toString()}`;
-    const resp = await fetch(url, {
-      headers: { 'Authorization': `Bearer ${apiKey}` },
-    });
-
-    if (!resp.ok) {
-      const errorBody = await resp.text().catch(() => '');
-      logger.error(`EV history upstream failed: ${resp.status} - ${errorBody.slice(0, 200)}`);
-      return res.status(resp.status).json({ success: false, error: `upstream failed (${resp.status})` });
-    }
-
-    const data = await resp.json();
-    return res.json(data);
-  } catch (err) {
-    logger.error(`EV history proxy error: ${err.message}`);
-    return res.status(502).json({ success: false, error: 'failed to fetch ev history' });
-  }
-});
-
 // -----------------------------------------------------------------------------
 // Analytics proxy endpoint
 // -----------------------------------------------------------------------------
