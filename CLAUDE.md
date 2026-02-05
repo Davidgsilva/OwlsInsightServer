@@ -39,7 +39,7 @@ Upstream Odds Provider (WebSocket)
 
 - **src/index.js** - Main entry point. Sets up Express server, Socket.io for clients, initializes upstream connector, manages cached data (`latestOddsData`, `latestScoresData`, `latestPropsData`, `latestBet365PropsData`, `latestFanDuelPropsData`, `latestDraftKingsPropsData`, `latestBetMGMPropsData`, `latestCaesarsPropsData`, `openingLines`), REST API proxies with caching, live score merging, and handles graceful shutdown.
 
-- **src/services/upstreamConnector.js** - Socket.io client that connects to the upstream odds provider. Handles authentication (API key via auth object, query params, and headers), reconnection logic, and event subscriptions. On connect, subscribes to sports: `['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf']` and books: `['pinnacle', 'fanduel', 'draftkings', 'betmgm', 'bet365', 'caesars']`. Also subscribes to player props from Pinnacle, Bet365, FanDuel, DraftKings, BetMGM, and Caesars.
+- **src/services/upstreamConnector.js** - Socket.io client that connects to the upstream odds provider. Handles authentication (API key via auth object, query params, and headers), reconnection logic, and event subscriptions. On connect, subscribes to sports: `['nba', 'ncaab', 'nfl', 'nhl', 'ncaaf']` and books: `['pinnacle', 'fanduel', 'draftkings', 'betmgm', 'bet365', 'caesars', 'kalshi']`. Also subscribes to player props from Pinnacle, Bet365, FanDuel, DraftKings, BetMGM, and Caesars (Kalshi does not offer props).
 
 - **src/services/dataTransformer.js** - Normalizes upstream data to Owls Insight format. Handles multiple input formats including The Odds API format (array of events) and pre-formatted sports objects. Calculates average odds across bookmakers. Output structure: `{ sports: { nba: [], nfl: [], nhl: [], ncaab: [], ncaaf: [] }, openingLines: {} }`
 
@@ -107,6 +107,10 @@ Team name aliases are defined in `TEAM_ALIASES` (e.g., `usc` → `southerncalifo
 - `GET /api/v1/:sport/moneyline?eventId=&books=` - Moneyline (h2h) only
 - `GET /api/v1/:sport/spreads?eventId=&books=` - Spreads only
 - `GET /api/v1/:sport/totals?eventId=&books=` - Totals only
+
+Books parameter accepts: `pinnacle`, `fanduel`, `draftkings`, `betmgm`, `bet365`, `caesars`, `kalshi`
+
+> **Note**: Kalshi is a CFTC-regulated prediction market exchange. Prices are converted from contract cents to American odds.
 
 **Player Props:**
 - `GET /api/v1/:sport/props` - Pinnacle player props (cached from WebSocket)
