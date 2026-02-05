@@ -119,7 +119,6 @@ Team name aliases are defined in `TEAM_ALIASES` (e.g., `usc` → `southerncalifo
 
 **EV & Arbitrage:**
 - `GET /api/v1/:sport/ev?eventId=&books=&min_ev=` - Expected value data
-- `GET /api/odds/ev/history?eventId=&book=&market=&side=&hours=` - EV history
 - `GET /api/v1/:sport/arbitrage?min_profit=` - Arbitrage opportunities
 
 **Analytics:**
@@ -179,7 +178,7 @@ nba-odds-app (API server) ← queries Redis for historical data
 
 ```bash
 # REST
-curl 'https://ws.owlsinsight.com/api/v1/nba/props/history?game_id=nba:BOS@SAC-20260122&player=Jaylen%20Brown&category=points'
+curl 'https://api.owlsinsight.com/api/v1/nba/props/history?game_id=nba:BOS@SAC-20260122&player=Jaylen%20Brown&category=points'
 
 # WebSocket
 socket.emit('request-props-history', {
@@ -191,18 +190,25 @@ socket.emit('request-props-history', {
 socket.on('props-history-response', (data) => { ... });
 ```
 
-## Production Ingress Ownership (CRITICAL)
+## Production Traffic Flow (Cloudflare Tunnel)
 
-**This repo manages the ONLY production ingress for ws.owlsinsight.com.**
+**As of Feb 1, 2026, production uses Cloudflare Tunnel instead of K8s ingress.**
 
-The ingress `owls-insight-server-ingress` in `k8s/ingress.yaml` routes external traffic to this proxy server, which then connects to the API server internally.
+The AWS ALB was replaced with Cloudflare Tunnel for cost savings, DDoS protection, and reliability.
 
-### Two Repos, Two Ingress Files
+### Current Architecture
 
-| Repo | File | Ingress Name | Purpose |
-|------|------|--------------|---------|
-| **OwlsInsightServer** (this repo) | `k8s/ingress.yaml` | `owls-insight-server-ingress` | PRODUCTION - ws.owlsinsight.com |
-| nba-odds-app | `k8s/base/ingress.yaml` | `owls-insight-ingress` | INTERNAL ONLY - NOT for production |
+```
+Users → Cloudflare (SSL termination, DDoS protection) → Cloudflare Tunnel → cloudflared pod → K8s Services
+```
+
+### Routes (managed in Cloudflare Zero Trust dashboard)
+
+| Domain | Backend Service | Auth |
+|--------|-----------------|------|
+| `api.owlsinsight.com` | `owls-insight-api-server:80` | Requires API key |
+| `ws.owlsinsight.com` | `owls-insight-server:80` | No auth (proxy has API key) |
+| `owlsinsight.com` | `owls-insight-frontend:80` | Public |
 
 ### Traffic Flow
 
@@ -210,10 +216,10 @@ The ingress `owls-insight-server-ingress` in `k8s/ingress.yaml` routes external 
 Frontend (no auth required)
     |
     v
-ws.owlsinsight.com (DNS -> ALB)
+ws.owlsinsight.com (Cloudflare)
     |
     v
-owls-insight-server-ingress (this repo's ingress)
+Cloudflare Tunnel → cloudflared pod
     |
     v
 owls-insight-server (this repo's proxy - has API key)
@@ -222,24 +228,26 @@ owls-insight-server (this repo's proxy - has API key)
 owls-insight-api-server (nba-odds-app - requires auth)
 ```
 
-### After any changes to k8s/ingress.yaml
+### Ingress File (Legacy - NOT DEPLOYED)
+
+The `k8s/ingress.yaml` file still exists in this repo but is **NOT deployed to the cluster**. Do not apply it - traffic routes through Cloudflare Tunnel, not K8s ingress.
+
+### Verify Production Health
 
 ```bash
-kubectl apply -f k8s/ingress.yaml -n owls-insight-dev
-kubectl get ingress -n owls-insight-dev  # Verify owls-insight-server-ingress exists
-curl -s https://ws.owlsinsight.com/health  # Verify health check passes
+# Check health through Cloudflare
+curl -s https://ws.owlsinsight.com/health | jq '.status'
+
+# Verify tunnel pod is running
+kubectl get deployment cloudflared-tunnel -n owls-insight-prod
+
+# Verify this proxy service has endpoints
+kubectl get endpoints -n owls-insight-prod owls-insight-server
 ```
 
-### If ingress gets misconfigured
+### What This Repo Manages
 
-The nba-odds-app repo has a validation script:
-```bash
-cd ~/Projects/WiseSportsServices/nba-odds-app
-./scripts/validate-ingress.sh
-```
+- Deployment `owls-insight-server` (the WebSocket proxy)
+- Service `owls-insight-server` (backend target for Cloudflare Tunnel)
 
-To restore correct ingress:
-```bash
-cd ~/Projects/WiseSportsServices/OwlsInsightServer
-kubectl apply -f k8s/ingress.yaml -n owls-insight-dev
-```
+See `nba-odds-app/CLAUDE.md` for full Cloudflare Tunnel configuration details.
